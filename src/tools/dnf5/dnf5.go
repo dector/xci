@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -26,29 +27,34 @@ type PackageUpdateResult struct {
 	Reason  string
 }
 
+var ansiColorPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
 // ListOutdated returns packages with available upgrades from dnf5.
 func ListOutdated() ([]OutdatedPackage, string, error) {
-	var outBuf, errBuf bytes.Buffer
-	cmd := exec.Command("dnf5", "check-upgrade", "--json")
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-
-	err := cmd.Run()
-	stdout := strings.TrimSpace(outBuf.String())
-	stderr := strings.TrimSpace(errBuf.String())
+	stdout, stderr, err := runCheckUpgrade("--json")
 	combinedOutput := combineOutput(stdout, stderr)
-
-	if !isAllowedCheckUpgradeExit(err) {
-		if strings.TrimSpace(combinedOutput) == "" {
-			return nil, combinedOutput, fmt.Errorf("failed to list outdated dnf5 packages: %w", err)
+	if isAllowedCheckUpgradeExit(err) {
+		packages, parseErr := parseCheckUpgradeJSON(stdout)
+		if parseErr != nil {
+			return nil, combinedOutput, fmt.Errorf("failed to parse outdated dnf5 packages: %w", parseErr)
 		}
 
-		return nil, combinedOutput, fmt.Errorf("failed to list outdated dnf5 packages: %w: %s", err, combinedOutput)
+		return packages, combinedOutput, nil
 	}
 
-	packages, err := parseCheckUpgradeJSON(stdout)
-	if err != nil {
-		return nil, combinedOutput, fmt.Errorf("failed to parse outdated dnf5 packages: %w", err)
+	if !isUnsupportedCheckUpgradeJSONError(err, combinedOutput) {
+		return nil, combinedOutput, buildListOutdatedError(err, combinedOutput)
+	}
+
+	stdout, stderr, err = runCheckUpgrade()
+	combinedOutput = combineOutput(stdout, stderr)
+	if !isAllowedCheckUpgradeExit(err) {
+		return nil, combinedOutput, buildListOutdatedError(err, combinedOutput)
+	}
+
+	packages, parseErr := parseCheckUpgradeText(combinedOutput)
+	if parseErr != nil {
+		return nil, combinedOutput, fmt.Errorf("failed to parse outdated dnf5 packages: %w", parseErr)
 	}
 
 	return packages, combinedOutput, nil
@@ -157,6 +163,66 @@ func parseCheckUpgradeJSON(output string) ([]OutdatedPackage, error) {
 	return packages, nil
 }
 
+func parseCheckUpgradeText(output string) ([]OutdatedPackage, error) {
+	output = stripANSIColors(output)
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return nil, nil
+	}
+
+	flattened := make([]OutdatedPackage, 0)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+
+		name, arch, ok := splitPackageSpec(fields[0])
+		if !ok {
+			continue
+		}
+
+		flattened = append(flattened, OutdatedPackage{
+			Name:       name,
+			Arch:       arch,
+			Latest:     fields[1],
+			Repository: fields[2],
+		})
+	}
+
+	sort.Slice(flattened, func(i, j int) bool {
+		specI := packageSpec(flattened[i].Name, flattened[i].Arch)
+		specJ := packageSpec(flattened[j].Name, flattened[j].Arch)
+		if specI != specJ {
+			return specI < specJ
+		}
+		if flattened[i].Latest != flattened[j].Latest {
+			return flattened[i].Latest < flattened[j].Latest
+		}
+
+		return flattened[i].Repository < flattened[j].Repository
+	})
+
+	seen := make(map[string]struct{}, len(flattened))
+	packages := make([]OutdatedPackage, 0, len(flattened))
+	for _, pkg := range flattened {
+		spec := packageSpec(pkg.Name, pkg.Arch)
+		if _, ok := seen[spec]; ok {
+			continue
+		}
+
+		seen[spec] = struct{}{}
+		packages = append(packages, pkg)
+	}
+
+	return packages, nil
+}
+
 func checkUpgradeExitCode(err error) (int, bool) {
 	if err == nil {
 		return 0, true
@@ -177,6 +243,58 @@ func isAllowedCheckUpgradeExit(err error) bool {
 	}
 
 	return code == 0 || code == 100
+}
+
+func isUnsupportedCheckUpgradeJSONError(err error, output string) bool {
+	code, ok := checkUpgradeExitCode(err)
+	if !ok || code != 2 {
+		return false
+	}
+
+	normalized := strings.ToLower(strings.TrimSpace(output))
+	return strings.Contains(normalized, `unknown argument "--json"`) && strings.Contains(normalized, "check-upgrade")
+}
+
+func buildListOutdatedError(err error, output string) error {
+	if strings.TrimSpace(output) == "" {
+		return fmt.Errorf("failed to list outdated dnf5 packages: %w", err)
+	}
+
+	return fmt.Errorf("failed to list outdated dnf5 packages: %w: %s", err, output)
+}
+
+func runCheckUpgrade(args ...string) (string, string, error) {
+	cmdArgs := []string{"check-upgrade"}
+	cmdArgs = append(cmdArgs, args...)
+
+	var outBuf, errBuf bytes.Buffer
+	cmd := exec.Command("dnf5", cmdArgs...)
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	err := cmd.Run()
+	stdout := strings.TrimSpace(outBuf.String())
+	stderr := strings.TrimSpace(errBuf.String())
+
+	return stdout, stderr, err
+}
+
+func stripANSIColors(text string) string {
+	return ansiColorPattern.ReplaceAllString(text, "")
+}
+
+func splitPackageSpec(spec string) (string, string, bool) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return "", "", false
+	}
+
+	idx := strings.LastIndex(spec, ".")
+	if idx <= 0 || idx == len(spec)-1 {
+		return "", "", false
+	}
+
+	return spec[:idx], spec[idx+1:], true
 }
 
 func packageSpec(name, arch string) string {
