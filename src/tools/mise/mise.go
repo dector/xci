@@ -1,13 +1,28 @@
 package mise
 
 import (
-	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 )
+
+type OutdatedPackage struct {
+	Name      string
+	Requested string
+	Current   string
+	Latest    string
+}
+
+type PackageUpdateResult struct {
+	Package OutdatedPackage
+	Success bool
+	Output  string
+	Reason  string
+}
 
 // Install runs 'mise use -g' with the provided arguments
 func Install(args []string) error {
@@ -30,50 +45,127 @@ func Install(args []string) error {
 	return miseCmd.Run()
 }
 
-// Update runs 'mise update --dry-run', asks for confirmation, then runs 'mise update'
-func Update() error {
-	// Run dry-run first and capture output
+// ListOutdated returns packages that have updates available.
+func ListOutdated() ([]OutdatedPackage, string, error) {
 	var outBuf, errBuf bytes.Buffer
-	dryRunCmd := exec.Command("mise", "up", "--dry-run")
-	dryRunCmd.Stdout = &outBuf
-	dryRunCmd.Stderr = &errBuf
+	cmd := exec.Command("mise", "outdated", "--json", "--quiet")
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
 
-	if err := dryRunCmd.Run(); err != nil {
-		return fmt.Errorf("dry-run failed: %w", err)
-	}
-
-	// Display the captured output
-	output := outBuf.String()
-	errOutput := errBuf.String()
-	fmt.Print(output)
-	fmt.Print(errOutput)
-
-	// Check if all tools are already up to date
-	if strings.Contains(output, "All tools are up to date") ||
-		strings.Contains(errOutput, "All tools are up to date") {
-		return nil
-	}
-
-	// Ask user for confirmation
-	fmt.Print("\nDo you want to continue with the update? (y/n): ")
-	reader := bufio.NewReader(os.Stdin)
-	response, err := reader.ReadString('\n')
+	err := cmd.Run()
+	stdout := strings.TrimSpace(outBuf.String())
+	stderr := strings.TrimSpace(errBuf.String())
+	combinedOutput := combineOutput(stdout, stderr)
 	if err != nil {
-		return fmt.Errorf("failed to read input: %w", err)
+		return nil, combinedOutput, fmt.Errorf("failed to list outdated tools: %w", err)
 	}
 
-	response = strings.ToLower(strings.TrimSpace(response))
-	if response != "y" {
-		fmt.Println("Update cancelled")
-		return nil
+	packages, err := parseOutdatedJSON(stdout)
+	if err != nil {
+		return nil, combinedOutput, fmt.Errorf("failed to parse outdated tools: %w", err)
 	}
 
-	// Run actual update
-	fmt.Println("\nUpdating...")
-	updateCmd := exec.Command("mise", "up")
-	updateCmd.Stdout = os.Stdout
-	updateCmd.Stderr = os.Stderr
-	updateCmd.Stdin = os.Stdin
+	return packages, combinedOutput, nil
+}
 
-	return updateCmd.Run()
+// UpdatePackages updates one package at a time and returns per-package results.
+func UpdatePackages(packages []OutdatedPackage) []PackageUpdateResult {
+	results := make([]PackageUpdateResult, 0, len(packages))
+
+	for _, pkg := range packages {
+		var outBuf, errBuf bytes.Buffer
+		cmd := exec.Command("mise", "up", pkg.Name)
+		cmd.Stdout = &outBuf
+		cmd.Stderr = &errBuf
+
+		err := cmd.Run()
+		stdout := strings.TrimSpace(outBuf.String())
+		stderr := strings.TrimSpace(errBuf.String())
+		output := combineOutput(stdout, stderr)
+
+		result := PackageUpdateResult{
+			Package: pkg,
+			Success: err == nil,
+			Output:  output,
+		}
+
+		if err != nil {
+			result.Reason = buildFailureReason(err, output)
+		}
+
+		results = append(results, result)
+	}
+
+	return results
+}
+
+func parseOutdatedJSON(output string) ([]OutdatedPackage, error) {
+	output = strings.TrimSpace(output)
+	if output == "" || output == "null" {
+		return nil, nil
+	}
+	if strings.Contains(output, "All tools are up to date") || strings.Contains(output, "All tools are up-to-date") {
+		return nil, nil
+	}
+
+	raw := map[string]struct {
+		Requested string `json:"requested"`
+		Current   string `json:"current"`
+		Latest    string `json:"latest"`
+	}{}
+
+	if err := json.Unmarshal([]byte(output), &raw); err != nil {
+		return nil, err
+	}
+
+	packages := make([]OutdatedPackage, 0, len(raw))
+	for name, item := range raw {
+		packages = append(packages, OutdatedPackage{
+			Name:      name,
+			Requested: item.Requested,
+			Current:   item.Current,
+			Latest:    item.Latest,
+		})
+	}
+
+	sort.Slice(packages, func(i, j int) bool {
+		return packages[i].Name < packages[j].Name
+	})
+
+	return packages, nil
+}
+
+func combineOutput(parts ...string) string {
+	nonEmpty := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+
+		nonEmpty = append(nonEmpty, trimmed)
+	}
+
+	return strings.Join(nonEmpty, "\n")
+}
+
+func buildFailureReason(err error, output string) string {
+	line := lastNonEmptyLine(output)
+	if line == "" {
+		return err.Error()
+	}
+
+	return fmt.Sprintf("%s (%v)", line, err)
+}
+
+func lastNonEmptyLine(text string) string {
+	lines := strings.Split(text, "\n")
+	for idx := len(lines) - 1; idx >= 0; idx-- {
+		line := strings.TrimSpace(lines[idx])
+		if line != "" {
+			return line
+		}
+	}
+
+	return ""
 }

@@ -8,6 +8,7 @@ import (
 	"xci/src/doctor"
 	"xci/src/tools"
 	"xci/src/tools/mise"
+	updatecmd "xci/src/update"
 	"xci/src/version"
 )
 
@@ -38,8 +39,8 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "update":
-		if err := mise.Update(); err != nil {
+	case "update", "up":
+		if err := updatecmd.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating: %v\n", err)
 			os.Exit(1)
 		}
@@ -60,8 +61,8 @@ func main() {
 		_ = version.Embedded
 
 	}
-
 }
+
 func command() string {
 	cmd := os.Args[0]
 	_, cmd = path.Split(cmd)
