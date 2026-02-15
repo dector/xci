@@ -1,11 +1,11 @@
+task run {
+    cmd "go run ./src/main.go"
+}
+
 task build {
     cmd "go build -o ./out/xci ./src/main.go"
 }
 
 task ai:build {
-    cmd "go build -o ./out/xci.llm ./src/main.go"
-}
-
-task ai:run {
-    cmd "go run ./src/main.go"
+    cmd "go build -o ./out/xci.ai ./src/main.go"
 }
