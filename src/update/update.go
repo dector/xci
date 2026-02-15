@@ -2,11 +2,20 @@ package update
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
+	"xci/internal/utils"
+	"xci/src/tools/dnf5"
 	"xci/src/tools/flatpak"
 	"xci/src/tools/mise"
+)
+
+var (
+	lookPathFunc           = exec.LookPath
+	detectDistroFamilyFunc = utils.DetectDistroFamily
 )
 
 type toolUpdatePlan struct {
@@ -94,10 +103,7 @@ func Run() error {
 }
 
 func collectUpdatePlans() []toolUpdatePlan {
-	backends := []toolBackend{
-		miseBackend(),
-		flatpakBackend(),
-	}
+	backends := registeredBackends()
 
 	plans := make([]toolUpdatePlan, 0, len(backends))
 	for _, backend := range backends {
@@ -112,6 +118,32 @@ func collectUpdatePlans() []toolUpdatePlan {
 	}
 
 	return plans
+}
+
+func registeredBackends() []toolBackend {
+	backends := []toolBackend{
+		miseBackend(),
+		flatpakBackend(),
+	}
+
+	if shouldIncludeDNF5Backend() {
+		backends = append(backends, dnf5Backend())
+	}
+
+	return backends
+}
+
+func shouldIncludeDNF5Backend() bool {
+	_, err := lookPathFunc("dnf5")
+	if err == nil {
+		return true
+	}
+
+	if !errors.Is(err, exec.ErrNotFound) {
+		return true
+	}
+
+	return detectDistroFamilyFunc() == utils.DistroFamilyFedoraLike
 }
 
 func miseBackend() toolBackend {
@@ -140,6 +172,20 @@ func flatpakBackend() toolBackend {
 		UpdatePackage: func(packages []updatePackage) []packageUpdateResult {
 			results := flatpak.UpdatePackages(options, mapToFlatpakOutdatedPackages(packages))
 			return mapFlatpakUpdateResults(results)
+		},
+	}
+}
+
+func dnf5Backend() toolBackend {
+	return toolBackend{
+		Name: "dnf5",
+		ListOutdated: func() ([]updatePackage, string, error) {
+			packages, output, err := dnf5.ListOutdated()
+			return mapDnf5OutdatedPackages(packages), output, err
+		},
+		UpdatePackage: func(packages []updatePackage) []packageUpdateResult {
+			results := dnf5.UpdatePackages(mapToDnf5OutdatedPackages(packages))
+			return mapDnf5UpdateResults(results)
 		},
 	}
 }
@@ -405,6 +451,60 @@ func mapFlatpakUpdateResults(results []flatpak.PackageUpdateResult) []packageUpd
 	}
 
 	return out
+}
+
+func mapDnf5OutdatedPackages(packages []dnf5.OutdatedPackage) []updatePackage {
+	out := make([]updatePackage, 0, len(packages))
+	for _, pkg := range packages {
+		out = append(out, updatePackage{
+			Name:      dnf5PackageSpec(pkg.Name, pkg.Arch),
+			Requested: pkg.Repository,
+			Latest:    pkg.Latest,
+		})
+	}
+
+	return out
+}
+
+func mapToDnf5OutdatedPackages(packages []updatePackage) []dnf5.OutdatedPackage {
+	out := make([]dnf5.OutdatedPackage, 0, len(packages))
+	for _, pkg := range packages {
+		out = append(out, dnf5.OutdatedPackage{
+			Name:       pkg.Name,
+			Latest:     pkg.Latest,
+			Repository: pkg.Requested,
+		})
+	}
+
+	return out
+}
+
+func mapDnf5UpdateResults(results []dnf5.PackageUpdateResult) []packageUpdateResult {
+	out := make([]packageUpdateResult, 0, len(results))
+	for _, result := range results {
+		out = append(out, packageUpdateResult{
+			Package: updatePackage{
+				Name:      dnf5PackageSpec(result.Package.Name, result.Package.Arch),
+				Requested: result.Package.Repository,
+				Latest:    result.Package.Latest,
+			},
+			Success: result.Success,
+			Output:  result.Output,
+			Reason:  result.Reason,
+		})
+	}
+
+	return out
+}
+
+func dnf5PackageSpec(name, arch string) string {
+	name = strings.TrimSpace(name)
+	arch = strings.TrimSpace(arch)
+	if arch == "" {
+		return name
+	}
+
+	return fmt.Sprintf("%s.%s", name, arch)
 }
 
 func describePackagePlanLine(pkg updatePackage) string {
