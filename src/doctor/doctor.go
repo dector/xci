@@ -15,6 +15,7 @@ type DoctorResult struct {
 func Run() bool {
 	checks := []func() DoctorResult{
 		checkMise,
+		checkFlatpak,
 	}
 
 	const (
@@ -36,6 +37,31 @@ func Run() bool {
 	}
 
 	return allOK
+}
+
+func checkFlatpak() DoctorResult {
+	flatpakPath, err := exec.LookPath("flatpak")
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return DoctorResult{
+				Name:    "flatpak",
+				OK:      false,
+				Message: "flatpak is not installed",
+			}
+		}
+
+		return DoctorResult{
+			Name:    "flatpak",
+			OK:      false,
+			Message: fmt.Sprintf("failed to find flatpak: %v", err),
+		}
+	}
+
+	return DoctorResult{
+		Name:    "flatpak",
+		OK:      true,
+		Message: fmt.Sprintf("flatpak is installed (%s)", flatpakPath),
+	}
 }
 
 func checkMise() DoctorResult {

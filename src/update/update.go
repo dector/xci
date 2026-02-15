@@ -5,14 +5,36 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"xci/src/tools/flatpak"
 	"xci/src/tools/mise"
 )
 
 type toolUpdatePlan struct {
 	ToolName     string
 	ListOutput   string
-	Packages     []mise.OutdatedPackage
+	Packages     []updatePackage
+	RunUpdate    func([]updatePackage) []packageUpdateResult
 	CollectError error
+}
+
+type updatePackage struct {
+	Name      string
+	Requested string
+	Current   string
+	Latest    string
+}
+
+type packageUpdateResult struct {
+	Package updatePackage
+	Success bool
+	Output  string
+	Reason  string
+}
+
+type toolBackend struct {
+	Name          string
+	ListOutdated  func() ([]updatePackage, string, error)
+	UpdatePackage func([]updatePackage) []packageUpdateResult
 }
 
 type toolUpdateSummary struct {
@@ -72,14 +94,52 @@ func Run() error {
 }
 
 func collectUpdatePlans() []toolUpdatePlan {
-	packages, output, err := mise.ListOutdated()
+	backends := []toolBackend{
+		miseBackend(),
+		flatpakBackend(),
+	}
 
-	return []toolUpdatePlan{
-		{
-			ToolName:     "mise",
+	plans := make([]toolUpdatePlan, 0, len(backends))
+	for _, backend := range backends {
+		packages, output, err := backend.ListOutdated()
+		plans = append(plans, toolUpdatePlan{
+			ToolName:     backend.Name,
 			ListOutput:   output,
 			Packages:     packages,
+			RunUpdate:    backend.UpdatePackage,
 			CollectError: err,
+		})
+	}
+
+	return plans
+}
+
+func miseBackend() toolBackend {
+	return toolBackend{
+		Name: "mise",
+		ListOutdated: func() ([]updatePackage, string, error) {
+			packages, output, err := mise.ListOutdated()
+			return mapMiseOutdatedPackages(packages), output, err
+		},
+		UpdatePackage: func(packages []updatePackage) []packageUpdateResult {
+			results := mise.UpdatePackages(mapToMiseOutdatedPackages(packages))
+			return mapMiseUpdateResults(results)
+		},
+	}
+}
+
+func flatpakBackend() toolBackend {
+	options := flatpak.Options{Scope: flatpak.ScopeUser}
+
+	return toolBackend{
+		Name: "flatpak",
+		ListOutdated: func() ([]updatePackage, string, error) {
+			packages, output, err := flatpak.ListOutdated(options)
+			return mapFlatpakOutdatedPackages(packages), output, err
+		},
+		UpdatePackage: func(packages []updatePackage) []packageUpdateResult {
+			results := flatpak.UpdatePackages(options, mapToFlatpakOutdatedPackages(packages))
+			return mapFlatpakUpdateResults(results)
 		},
 	}
 }
@@ -102,11 +162,7 @@ func printUpdatePlanSections(plans []toolUpdatePlan) {
 		fmt.Printf("%d package(s) can be updated:\n", len(plan.Packages))
 
 		for idx, pkg := range plan.Packages {
-			fmt.Printf("%d. %-16s %s -> %s", idx+1, pkg.Name, valueOrUnknown(pkg.Current), valueOrUnknown(pkg.Latest))
-			if strings.TrimSpace(pkg.Requested) != "" {
-				fmt.Printf(" (requested: %s)", pkg.Requested)
-			}
-			fmt.Println()
+			fmt.Printf("%d. %s\n", idx+1, describePackagePlanLine(pkg))
 		}
 	}
 }
@@ -187,7 +243,7 @@ func executeUpdates(plans []toolUpdatePlan) []toolUpdateSummary {
 			continue
 		}
 
-		results := mise.UpdatePackages(plan.Packages)
+		results := plan.RunUpdate(plan.Packages)
 		outputParts := make([]string, 0, len(results)+1)
 		if strings.TrimSpace(summary.Output) != "" {
 			outputParts = append(outputParts, fmt.Sprintf("outdated check:\n%s", summary.Output))
@@ -196,7 +252,7 @@ func executeUpdates(plans []toolUpdatePlan) []toolUpdateSummary {
 		for _, result := range results {
 			resultOutput := result.Output
 			if strings.TrimSpace(resultOutput) != "" {
-				outputParts = append(outputParts, fmt.Sprintf("%s output:\n%s", result.Package.Name, resultOutput))
+				outputParts = append(outputParts, fmt.Sprintf("%s output:\n%s", valueOrUnknown(result.Package.Name), resultOutput))
 			}
 
 			if result.Success {
@@ -205,7 +261,7 @@ func executeUpdates(plans []toolUpdatePlan) []toolUpdateSummary {
 			}
 
 			summary.FailedPackages++
-			summary.FailureReasons = append(summary.FailureReasons, fmt.Sprintf("%s: %s", result.Package.Name, result.Reason))
+			summary.FailureReasons = append(summary.FailureReasons, fmt.Sprintf("%s: %s", valueOrUnknown(result.Package.Name), result.Reason))
 		}
 
 		summary.Output = strings.Join(outputParts, "\n\n")
@@ -270,6 +326,111 @@ func askUserConfirmation(prompt string) (bool, error) {
 
 	response = strings.ToLower(strings.TrimSpace(response))
 	return response == "y" || response == "yes", nil
+}
+
+func mapMiseOutdatedPackages(packages []mise.OutdatedPackage) []updatePackage {
+	out := make([]updatePackage, 0, len(packages))
+	for _, pkg := range packages {
+		out = append(out, updatePackage{
+			Name:      pkg.Name,
+			Requested: pkg.Requested,
+			Current:   pkg.Current,
+			Latest:    pkg.Latest,
+		})
+	}
+
+	return out
+}
+
+func mapToMiseOutdatedPackages(packages []updatePackage) []mise.OutdatedPackage {
+	out := make([]mise.OutdatedPackage, 0, len(packages))
+	for _, pkg := range packages {
+		out = append(out, mise.OutdatedPackage{
+			Name:      pkg.Name,
+			Requested: pkg.Requested,
+			Current:   pkg.Current,
+			Latest:    pkg.Latest,
+		})
+	}
+
+	return out
+}
+
+func mapMiseUpdateResults(results []mise.PackageUpdateResult) []packageUpdateResult {
+	out := make([]packageUpdateResult, 0, len(results))
+	for _, result := range results {
+		out = append(out, packageUpdateResult{
+			Package: updatePackage{
+				Name:      result.Package.Name,
+				Requested: result.Package.Requested,
+				Current:   result.Package.Current,
+				Latest:    result.Package.Latest,
+			},
+			Success: result.Success,
+			Output:  result.Output,
+			Reason:  result.Reason,
+		})
+	}
+
+	return out
+}
+
+func mapFlatpakOutdatedPackages(packages []flatpak.OutdatedPackage) []updatePackage {
+	out := make([]updatePackage, 0, len(packages))
+	for _, pkg := range packages {
+		out = append(out, updatePackage{Name: pkg.Ref})
+	}
+
+	return out
+}
+
+func mapToFlatpakOutdatedPackages(packages []updatePackage) []flatpak.OutdatedPackage {
+	out := make([]flatpak.OutdatedPackage, 0, len(packages))
+	for _, pkg := range packages {
+		out = append(out, flatpak.OutdatedPackage{Ref: pkg.Name})
+	}
+
+	return out
+}
+
+func mapFlatpakUpdateResults(results []flatpak.PackageUpdateResult) []packageUpdateResult {
+	out := make([]packageUpdateResult, 0, len(results))
+	for _, result := range results {
+		out = append(out, packageUpdateResult{
+			Package: updatePackage{Name: result.Package.Ref},
+			Success: result.Success,
+			Output:  result.Output,
+			Reason:  result.Reason,
+		})
+	}
+
+	return out
+}
+
+func describePackagePlanLine(pkg updatePackage) string {
+	name := strings.TrimSpace(pkg.Name)
+	if name == "" {
+		name = "unknown"
+	}
+
+	requested := strings.TrimSpace(pkg.Requested)
+	current := strings.TrimSpace(pkg.Current)
+	latest := strings.TrimSpace(pkg.Latest)
+
+	if current == "" && latest == "" {
+		if requested == "" {
+			return name
+		}
+
+		return fmt.Sprintf("%s (requested: %s)", name, requested)
+	}
+
+	line := fmt.Sprintf("%s %s -> %s", name, valueOrUnknown(current), valueOrUnknown(latest))
+	if requested != "" {
+		line = fmt.Sprintf("%s (requested: %s)", line, requested)
+	}
+
+	return line
 }
 
 func appendOutput(prefix, output string) string {
