@@ -1,45 +1,13 @@
-package tools
+package mise
 
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 )
-
-type DoctorResult struct {
-	Name    string
-	OK      bool
-	Message string
-}
-
-func Doctor() DoctorResult {
-	misePath, err := exec.LookPath("mise")
-	if err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return DoctorResult{
-				Name:    "mise",
-				OK:      false,
-				Message: "mise is not installed",
-			}
-		}
-
-		return DoctorResult{
-			Name:    "mise",
-			OK:      false,
-			Message: fmt.Sprintf("failed to find mise: %v", err),
-		}
-	}
-
-	return DoctorResult{
-		Name:    "mise",
-		OK:      true,
-		Message: fmt.Sprintf("mise is installed (%s)", misePath),
-	}
-}
 
 // Install runs 'mise use -g' with the provided arguments
 func Install(args []string) error {

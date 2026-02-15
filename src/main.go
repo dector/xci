@@ -5,7 +5,9 @@ import (
 	"os"
 	"path"
 	"xci/internal/utils"
+	"xci/src/doctor"
 	"xci/src/tools"
+	"xci/src/tools/mise"
 	"xci/src/version"
 )
 
@@ -20,7 +22,7 @@ func main() {
 
 	switch cmd {
 	case "doctor":
-		if !runDoctor() {
+		if !doctor.Run() {
 			os.Exit(1)
 		}
 
@@ -31,13 +33,13 @@ func main() {
 			return
 		}
 
-		if err := tools.Install(args); err != nil {
+		if err := mise.Install(args); err != nil {
 			fmt.Fprintf(os.Stderr, "Error installing: %v\n", err)
 			os.Exit(1)
 		}
 
 	case "update":
-		if err := tools.Update(); err != nil {
+		if err := mise.Update(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating: %v\n", err)
 			os.Exit(1)
 		}
@@ -60,33 +62,6 @@ func main() {
 	}
 
 }
-
-func runDoctor() bool {
-	checks := []func() tools.DoctorResult{
-		tools.Doctor,
-	}
-
-	const (
-		green = "\033[32m"
-		red   = "\033[31m"
-		reset = "\033[0m"
-	)
-
-	allOK := true
-	for _, check := range checks {
-		result := check()
-		if result.OK {
-			fmt.Printf("%s✓ %s%s\n", green, result.Message, reset)
-			continue
-		}
-
-		allOK = false
-		fmt.Printf("%s✗ %s%s\n", red, result.Message, reset)
-	}
-
-	return allOK
-}
-
 func command() string {
 	cmd := os.Args[0]
 	_, cmd = path.Split(cmd)
