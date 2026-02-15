@@ -176,6 +176,86 @@ func TestFramedBlockIgnoresANSIInWidth(t *testing.T) {
 	}
 }
 
+func TestWrappedToolSummaryLinesWrapsNames(t *testing.T) {
+	t.Parallel()
+
+	got := wrappedToolSummaryLines("dnf5", []string{"alpha", "beta", "gamma", "delta"}, 20)
+	want := []string{
+		"dnf5: alpha beta",
+		"      gamma delta",
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected wrapped lines:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestWrappedToolSummaryLinesWrapsLongName(t *testing.T) {
+	t.Parallel()
+
+	got := wrappedToolSummaryLines("dnf5", []string{"abcdefghijkl"}, 12)
+	want := []string{
+		"dnf5: abcdef",
+		"      ghijkl",
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected wrapped long-name lines:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestWrappedToolSummaryLinesNone(t *testing.T) {
+	t.Parallel()
+
+	got := wrappedToolSummaryLines("flatpak", nil, 20)
+	want := []string{"flatpak: (none)"}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected none lines:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestSummaryContentWidth(t *testing.T) {
+	original := terminalColumnsFunc
+	terminalColumnsFunc = func() int { return 120 }
+	t.Cleanup(func() {
+		terminalColumnsFunc = original
+	})
+
+	if got := summaryContentWidth(); got != 116 {
+		t.Fatalf("unexpected summary width for wide terminal: %d", got)
+	}
+}
+
+func TestSummaryContentWidthFallbackWhenInvalid(t *testing.T) {
+	original := terminalColumnsFunc
+	terminalColumnsFunc = func() int { return 0 }
+	t.Cleanup(func() {
+		terminalColumnsFunc = original
+	})
+
+	if got := summaryContentWidth(); got != 76 {
+		t.Fatalf("unexpected fallback summary width: %d", got)
+	}
+}
+
+func TestOverallSummaryDisplayLinesRespectWidth(t *testing.T) {
+	t.Parallel()
+
+	lines := overallSummaryDisplayLines([]toolUpdateSummary{
+		{
+			ToolName:     "dnf5",
+			UpdatedNames: []string{"alpha", "beta", "gamma", "delta", "epsilon"},
+		},
+	}, 5, 0, 20)
+
+	for _, line := range lines {
+		if visibleLen(line) > 20 {
+			t.Fatalf("line exceeds configured width (%d): %q", visibleLen(line), line)
+		}
+	}
+}
+
 func TestMapDnf5OutdatedPackagesIncludesCurrent(t *testing.T) {
 	t.Parallel()
 

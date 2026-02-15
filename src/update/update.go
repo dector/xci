@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 	"xci/internal/utils"
@@ -19,6 +20,7 @@ import (
 var (
 	lookPathFunc           = exec.LookPath
 	detectDistroFamilyFunc = utils.DetectDistroFamily
+	terminalColumnsFunc    = detectTerminalColumns
 	colorOutputEnabled     = supportsColorOutput()
 	ansiEscapePattern      = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 )
@@ -30,6 +32,9 @@ const (
 	ansiYellow   = "\033[33m"
 	ansiRed      = "\033[31m"
 	ansiBoldCyan = "\033[1;36m"
+
+	defaultTerminalColumns = 80
+	frameHorizontalPadding = 4
 )
 
 type toolUpdatePlan struct {
@@ -373,7 +378,7 @@ func printUpdateSummarySections(summaries []toolUpdateSummary) {
 	}
 
 	fmt.Println()
-	fmt.Print(framedBlock(overallSummaryDisplayLines(summaries, totalUpdated, totalFailed)))
+	fmt.Print(framedBlock(overallSummaryDisplayLines(summaries, totalUpdated, totalFailed, summaryContentWidth())))
 }
 
 func askUserConfirmation(prompt string) (bool, error) {
@@ -597,6 +602,7 @@ func overallSummaryLines(summaries []toolUpdateSummary, totalUpdated, totalFaile
 		fmt.Sprintf("Updated: %d", totalUpdated),
 		fmt.Sprintf("Failed: %d", totalFailed),
 		"",
+		"Updated packages by tool:",
 	}
 
 	for _, summary := range summaries {
@@ -606,7 +612,7 @@ func overallSummaryLines(summaries []toolUpdateSummary, totalUpdated, totalFaile
 	return lines
 }
 
-func overallSummaryDisplayLines(summaries []toolUpdateSummary, totalUpdated, totalFailed int) []string {
+func overallSummaryDisplayLines(summaries []toolUpdateSummary, totalUpdated, totalFailed, maxContentWidth int) []string {
 	lines := []string{
 		fmt.Sprintf("%s: %s", colorize("Updated", ansiBoldCyan), colorizedCount(totalUpdated, ansiGreen)),
 		fmt.Sprintf("%s: %s", colorize("Failed", ansiBoldCyan), colorizedCount(totalFailed, ansiRed)),
@@ -614,25 +620,42 @@ func overallSummaryDisplayLines(summaries []toolUpdateSummary, totalUpdated, tot
 	}
 
 	for _, summary := range summaries {
-		updatedPackages := formatUpdatedNames(summary.UpdatedNames)
-		if updatedPackages == "(none)" {
-			updatedPackages = colorize(updatedPackages, ansiYellow)
-		} else {
-			updatedPackages = colorize(updatedPackages, ansiGreen)
+		toolName := valueOrUnknown(summary.ToolName)
+		normalizedNames := normalizedUpdatedNames(summary.UpdatedNames)
+		wrappedLines := wrappedToolSummaryLines(toolName, normalizedNames, maxContentWidth)
+
+		prefix := fmt.Sprintf("%s: ", toolName)
+		continuationPrefix := strings.Repeat(" ", visibleLen(prefix))
+		valueColor := ansiGreen
+		if len(normalizedNames) == 0 {
+			valueColor = ansiYellow
 		}
 
-		tool := colorize(summary.ToolName, ansiBlue)
-		lines = append(lines, fmt.Sprintf("%s: %s", tool, updatedPackages))
+		for idx, line := range wrappedLines {
+			if idx == 0 {
+				value := strings.TrimPrefix(line, prefix)
+				lines = append(lines, fmt.Sprintf("%s: %s", colorize(toolName, ansiBlue), colorize(value, valueColor)))
+				continue
+			}
+
+			value := strings.TrimPrefix(line, continuationPrefix)
+			lines = append(lines, continuationPrefix+colorize(value, valueColor))
+		}
 	}
 
 	return lines
 }
 
 func formatUpdatedNames(names []string) string {
-	if len(names) == 0 {
+	normalized := normalizedUpdatedNames(names)
+	if len(normalized) == 0 {
 		return "(none)"
 	}
 
+	return strings.Join(normalized, " ")
+}
+
+func normalizedUpdatedNames(names []string) []string {
 	clean := make([]string, 0, len(names))
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
@@ -648,12 +671,110 @@ func formatUpdatedNames(names []string) string {
 		clean = append(clean, name)
 	}
 
-	if len(clean) == 0 {
-		return "(none)"
+	sort.Strings(clean)
+	return clean
+}
+
+func wrappedToolSummaryLines(toolName string, names []string, maxContentWidth int) []string {
+	prefix := fmt.Sprintf("%s: ", toolName)
+	continuationPrefix := strings.Repeat(" ", visibleLen(prefix))
+	prefixWidth := visibleLen(prefix)
+	if maxContentWidth <= prefixWidth {
+		maxContentWidth = prefixWidth + 1
 	}
 
-	sort.Strings(clean)
-	return strings.Join(clean, " ")
+	if len(names) == 0 {
+		return []string{prefix + "(none)"}
+	}
+
+	maxValueWidth := maxContentWidth - prefixWidth
+	if maxValueWidth < 1 {
+		maxValueWidth = 1
+	}
+
+	lines := make([]string, 0, len(names))
+	currentPrefix := prefix
+	currentWords := make([]string, 0, 4)
+	currentValueWidth := 0
+
+	flush := func() {
+		if len(currentWords) == 0 {
+			return
+		}
+
+		lines = append(lines, currentPrefix+strings.Join(currentWords, " "))
+		currentPrefix = continuationPrefix
+		currentWords = currentWords[:0]
+		currentValueWidth = 0
+	}
+
+	for _, name := range names {
+		for _, chunk := range splitByWidth(name, maxValueWidth) {
+			chunkWidth := visibleLen(chunk)
+			if len(currentWords) == 0 {
+				currentWords = append(currentWords, chunk)
+				currentValueWidth = chunkWidth
+				continue
+			}
+
+			if currentValueWidth+1+chunkWidth <= maxValueWidth {
+				currentWords = append(currentWords, chunk)
+				currentValueWidth += 1 + chunkWidth
+				continue
+			}
+
+			flush()
+			currentWords = append(currentWords, chunk)
+			currentValueWidth = chunkWidth
+		}
+	}
+
+	flush()
+	return lines
+}
+
+func splitByWidth(value string, maxWidth int) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+
+	if maxWidth <= 0 || visibleLen(value) <= maxWidth {
+		return []string{value}
+	}
+
+	runes := []rune(value)
+	parts := make([]string, 0, (len(runes)+maxWidth-1)/maxWidth)
+	for start := 0; start < len(runes); start += maxWidth {
+		end := start + maxWidth
+		if end > len(runes) {
+			end = len(runes)
+		}
+
+		parts = append(parts, string(runes[start:end]))
+	}
+
+	return parts
+}
+
+func summaryContentWidth() int {
+	columns := terminalColumnsFunc()
+	if columns <= frameHorizontalPadding {
+		return defaultTerminalColumns - frameHorizontalPadding
+	}
+
+	return columns - frameHorizontalPadding
+}
+
+func detectTerminalColumns() int {
+	envColumns := strings.TrimSpace(os.Getenv("COLUMNS"))
+	if envColumns != "" {
+		if parsed, err := strconv.Atoi(envColumns); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+
+	return defaultTerminalColumns
 }
 
 func framedBlock(lines []string) string {
