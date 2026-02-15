@@ -474,6 +474,7 @@ func mapDnf5OutdatedPackages(packages []dnf5.OutdatedPackage) []updatePackage {
 		out = append(out, updatePackage{
 			Name:      dnf5PackageSpec(pkg.Name, pkg.Arch),
 			Requested: pkg.Repository,
+			Current:   pkg.Current,
 			Latest:    pkg.Latest,
 		})
 	}
@@ -486,6 +487,7 @@ func mapToDnf5OutdatedPackages(packages []updatePackage) []dnf5.OutdatedPackage 
 	for _, pkg := range packages {
 		out = append(out, dnf5.OutdatedPackage{
 			Name:       pkg.Name,
+			Current:    pkg.Current,
 			Latest:     pkg.Latest,
 			Repository: pkg.Requested,
 		})
@@ -501,6 +503,7 @@ func mapDnf5UpdateResults(results []dnf5.PackageUpdateResult) []packageUpdateRes
 			Package: updatePackage{
 				Name:      dnf5PackageSpec(result.Package.Name, result.Package.Arch),
 				Requested: result.Package.Repository,
+				Current:   result.Package.Current,
 				Latest:    result.Package.Latest,
 			},
 			Success: result.Success,

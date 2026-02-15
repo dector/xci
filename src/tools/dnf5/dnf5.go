@@ -16,6 +16,7 @@ import (
 type OutdatedPackage struct {
 	Name       string
 	Arch       string
+	Current    string
 	Latest     string
 	Repository string
 }
@@ -39,6 +40,8 @@ func ListOutdated() ([]OutdatedPackage, string, error) {
 			return nil, combinedOutput, fmt.Errorf("failed to parse outdated dnf5 packages: %w", parseErr)
 		}
 
+		applyInstalledVersions(packages, installedVersionsByPackageSpec(packages))
+
 		return packages, combinedOutput, nil
 	}
 
@@ -56,6 +59,8 @@ func ListOutdated() ([]OutdatedPackage, string, error) {
 	if parseErr != nil {
 		return nil, combinedOutput, fmt.Errorf("failed to parse outdated dnf5 packages: %w", parseErr)
 	}
+
+	applyInstalledVersions(packages, installedVersionsByPackageSpec(packages))
 
 	return packages, combinedOutput, nil
 }
@@ -221,6 +226,111 @@ func parseCheckUpgradeText(output string) ([]OutdatedPackage, error) {
 	}
 
 	return packages, nil
+}
+
+func installedVersionsByPackageSpec(packages []OutdatedPackage) map[string]string {
+	specs := uniquePackageSpecs(packages)
+	if len(specs) == 0 {
+		return nil
+	}
+
+	stdout, _, err := queryInstalledPackageVersions(specs)
+	versions := parseInstalledVersionOutput(stdout)
+	if err != nil && len(versions) == 0 {
+		return nil
+	}
+
+	return versions
+}
+
+func uniquePackageSpecs(packages []OutdatedPackage) []string {
+	seen := make(map[string]struct{}, len(packages))
+	specs := make([]string, 0, len(packages))
+
+	for _, pkg := range packages {
+		spec := packageSpec(pkg.Name, pkg.Arch)
+		if spec == "" {
+			continue
+		}
+
+		if _, ok := seen[spec]; ok {
+			continue
+		}
+
+		seen[spec] = struct{}{}
+		specs = append(specs, spec)
+	}
+
+	sort.Strings(specs)
+	return specs
+}
+
+func queryInstalledPackageVersions(specs []string) (string, string, error) {
+	args := []string{"-q", "--queryformat", `%{NAME}.%{ARCH}|%{EPOCHNUM}|%{VERSION}-%{RELEASE}\n`}
+	args = append(args, specs...)
+
+	var outBuf, errBuf bytes.Buffer
+	cmd := exec.Command("rpm", args...)
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	err := cmd.Run()
+	stdout := strings.TrimSpace(outBuf.String())
+	stderr := strings.TrimSpace(errBuf.String())
+
+	return stdout, stderr, err
+}
+
+func parseInstalledVersionOutput(output string) map[string]string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return nil
+	}
+
+	versions := make(map[string]string)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) != 3 {
+			continue
+		}
+
+		spec := strings.TrimSpace(parts[0])
+		epoch := strings.TrimSpace(parts[1])
+		version := strings.TrimSpace(parts[2])
+		if spec == "" || version == "" {
+			continue
+		}
+
+		if epoch != "" && epoch != "0" && !strings.EqualFold(epoch, "(none)") {
+			version = fmt.Sprintf("%s:%s", epoch, version)
+		}
+
+		versions[spec] = version
+	}
+
+	if len(versions) == 0 {
+		return nil
+	}
+
+	return versions
+}
+
+func applyInstalledVersions(packages []OutdatedPackage, versions map[string]string) {
+	if len(packages) == 0 || len(versions) == 0 {
+		return
+	}
+
+	for idx := range packages {
+		spec := packageSpec(packages[idx].Name, packages[idx].Arch)
+		if current, ok := versions[spec]; ok {
+			packages[idx].Current = current
+		}
+	}
 }
 
 func checkUpgradeExitCode(err error) (int, bool) {

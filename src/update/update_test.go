@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"xci/internal/utils"
+	"xci/src/tools/dnf5"
 )
 
 func TestRegisteredBackendsIncludesDNF5WhenFound(t *testing.T) {
@@ -172,5 +173,33 @@ func TestFramedBlockIgnoresANSIInWidth(t *testing.T) {
 	}
 	if !strings.Contains(block, "│ tool: \x1b[31mfoo\x1b[0m  │") {
 		t.Fatalf("expected ANSI line to keep visual padding, got: %q", block)
+	}
+}
+
+func TestMapDnf5OutdatedPackagesIncludesCurrent(t *testing.T) {
+	t.Parallel()
+
+	input := []dnf5.OutdatedPackage{
+		{
+			Name:       "bash",
+			Arch:       "x86_64",
+			Repository: "updates",
+			Current:    "5.2-7.fc41",
+			Latest:     "5.2-8.fc41",
+		},
+	}
+
+	got := mapDnf5OutdatedPackages(input)
+	want := []updatePackage{
+		{
+			Name:      "bash.x86_64",
+			Requested: "updates",
+			Current:   "5.2-7.fc41",
+			Latest:    "5.2-8.fc41",
+		},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected mapped packages\nwant: %#v\ngot:  %#v", want, got)
 	}
 }

@@ -105,6 +105,51 @@ func TestUnsupportedCheckUpgradeJSONError(t *testing.T) {
 	}
 }
 
+func TestParseInstalledVersionOutput(t *testing.T) {
+	t.Parallel()
+
+	input := "bash.x86_64|0|5.2-8.fc41\n" +
+		"kernel.x86_64|1|6.8.12-100.fc41\n" +
+		"zlib.i686|(none)|1.3-1.fc41\n" +
+		"invalid-line"
+
+	got := parseInstalledVersionOutput(input)
+	want := map[string]string{
+		"bash.x86_64":   "5.2-8.fc41",
+		"kernel.x86_64": "1:6.8.12-100.fc41",
+		"zlib.i686":     "1.3-1.fc41",
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected versions\nwant: %#v\ngot:  %#v", want, got)
+	}
+}
+
+func TestApplyInstalledVersions(t *testing.T) {
+	t.Parallel()
+
+	packages := []OutdatedPackage{
+		{Name: "bash", Arch: "x86_64", Latest: "5.2-8.fc41"},
+		{Name: "zlib", Arch: "i686", Latest: "1.3-1.fc41"},
+		{Name: "vim", Arch: "x86_64", Latest: "9.1-2.fc41"},
+	}
+
+	applyInstalledVersions(packages, map[string]string{
+		"bash.x86_64": "5.2-7.fc41",
+		"zlib.i686":   "1.2.13-4.fc41",
+	})
+
+	if packages[0].Current != "5.2-7.fc41" {
+		t.Fatalf("unexpected current version for bash: %q", packages[0].Current)
+	}
+	if packages[1].Current != "1.2.13-4.fc41" {
+		t.Fatalf("unexpected current version for zlib: %q", packages[1].Current)
+	}
+	if packages[2].Current != "" {
+		t.Fatalf("expected empty current version for vim, got: %q", packages[2].Current)
+	}
+}
+
 func runExitCodeCommand(t *testing.T, code int) error {
 	t.Helper()
 
