@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"sort"
 	"strings"
+	"unicode/utf8"
 	"xci/internal/utils"
 	"xci/src/tools/dnf5"
 	"xci/src/tools/flatpak"
@@ -16,6 +19,17 @@ import (
 var (
 	lookPathFunc           = exec.LookPath
 	detectDistroFamilyFunc = utils.DetectDistroFamily
+	colorOutputEnabled     = supportsColorOutput()
+	ansiEscapePattern      = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+)
+
+const (
+	ansiReset    = "\033[0m"
+	ansiBlue     = "\033[34m"
+	ansiGreen    = "\033[32m"
+	ansiYellow   = "\033[33m"
+	ansiRed      = "\033[31m"
+	ansiBoldCyan = "\033[1;36m"
 )
 
 type toolUpdatePlan struct {
@@ -51,6 +65,7 @@ type toolUpdateSummary struct {
 	Status          string
 	Output          string
 	UpdatedPackages int
+	UpdatedNames    []string
 	FailedPackages  int
 	FailureReasons  []string
 }
@@ -191,12 +206,12 @@ func dnf5Backend() toolBackend {
 }
 
 func printUpdatePlanSections(plans []toolUpdatePlan) {
-	fmt.Println("\nUpdate plan:")
+	fmt.Println(colorize("\nUpdate plan:", ansiBoldCyan))
 
 	for _, plan := range plans {
-		fmt.Printf("\n[%s]\n", plan.ToolName)
+		fmt.Printf("\n%s\n", colorize(fmt.Sprintf("[%s]", plan.ToolName), ansiBlue))
 		if plan.CollectError != nil {
-			fmt.Printf("Could not collect outdated packages: %v\n", plan.CollectError)
+			fmt.Printf("%s\n", colorize(fmt.Sprintf("Could not collect outdated packages: %v", plan.CollectError), ansiRed))
 			continue
 		}
 
@@ -303,6 +318,7 @@ func executeUpdates(plans []toolUpdatePlan) []toolUpdateSummary {
 
 			if result.Success {
 				summary.UpdatedPackages++
+				summary.UpdatedNames = append(summary.UpdatedNames, valueOrUnknown(result.Package.Name))
 				continue
 			}
 
@@ -326,7 +342,7 @@ func executeUpdates(plans []toolUpdatePlan) []toolUpdateSummary {
 }
 
 func printUpdateSummarySections(summaries []toolUpdateSummary) {
-	fmt.Println("\nUpdate results:")
+	fmt.Println(colorize("\nUpdate results:", ansiBoldCyan))
 
 	totalUpdated := 0
 	totalFailed := 0
@@ -335,19 +351,19 @@ func printUpdateSummarySections(summaries []toolUpdateSummary) {
 		totalUpdated += summary.UpdatedPackages
 		totalFailed += summary.FailedPackages
 
-		fmt.Printf("\n[%s]\n", summary.ToolName)
-		fmt.Printf("Result: %s\n", describeStatus(summary.Status))
-		fmt.Printf("Updated: %d\n", summary.UpdatedPackages)
-		fmt.Printf("Failed: %d\n", summary.FailedPackages)
+		fmt.Printf("\n%s\n", colorize(fmt.Sprintf("[%s]", summary.ToolName), ansiBlue))
+		fmt.Printf("Result: %s\n", colorizedStatus(summary.Status))
+		fmt.Printf("Updated: %s\n", colorizedCount(summary.UpdatedPackages, ansiGreen))
+		fmt.Printf("Failed: %s\n", colorizedCount(summary.FailedPackages, ansiRed))
 
 		if len(summary.FailureReasons) > 0 {
-			fmt.Println("Failure reasons:")
+			fmt.Println(colorize("Failure reasons:", ansiRed))
 			for _, reason := range summary.FailureReasons {
 				fmt.Printf("- %s\n", reason)
 			}
 		}
 
-		fmt.Println("Output:")
+		fmt.Println(colorize("Output:", ansiBlue))
 		if strings.TrimSpace(summary.Output) == "" {
 			fmt.Println("(no output captured)")
 			continue
@@ -356,9 +372,8 @@ func printUpdateSummarySections(summaries []toolUpdateSummary) {
 		printIndented(summary.Output, "  ")
 	}
 
-	fmt.Println("\nOverall:")
-	fmt.Printf("Updated: %d\n", totalUpdated)
-	fmt.Printf("Failed: %d\n", totalFailed)
+	fmt.Println()
+	fmt.Print(framedBlock(overallSummaryDisplayLines(summaries, totalUpdated, totalFailed)))
 }
 
 func askUserConfirmation(prompt string) (bool, error) {
@@ -572,6 +587,155 @@ func describeStatus(status string) string {
 	default:
 		return status
 	}
+}
+
+func overallSummaryLines(summaries []toolUpdateSummary, totalUpdated, totalFailed int) []string {
+	lines := []string{
+		fmt.Sprintf("Updated: %d", totalUpdated),
+		fmt.Sprintf("Failed: %d", totalFailed),
+		"",
+	}
+
+	for _, summary := range summaries {
+		lines = append(lines, fmt.Sprintf("%s: %s", summary.ToolName, formatUpdatedNames(summary.UpdatedNames)))
+	}
+
+	return lines
+}
+
+func overallSummaryDisplayLines(summaries []toolUpdateSummary, totalUpdated, totalFailed int) []string {
+	lines := []string{
+		fmt.Sprintf("%s: %s", colorize("Updated", ansiBoldCyan), colorizedCount(totalUpdated, ansiGreen)),
+		fmt.Sprintf("%s: %s", colorize("Failed", ansiBoldCyan), colorizedCount(totalFailed, ansiRed)),
+		"",
+	}
+
+	for _, summary := range summaries {
+		updatedPackages := formatUpdatedNames(summary.UpdatedNames)
+		if updatedPackages == "(none)" {
+			updatedPackages = colorize(updatedPackages, ansiYellow)
+		} else {
+			updatedPackages = colorize(updatedPackages, ansiGreen)
+		}
+
+		tool := colorize(summary.ToolName, ansiBlue)
+		lines = append(lines, fmt.Sprintf("%s: %s", tool, updatedPackages))
+	}
+
+	return lines
+}
+
+func formatUpdatedNames(names []string) string {
+	if len(names) == 0 {
+		return "(none)"
+	}
+
+	clean := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+
+		seen[name] = struct{}{}
+		clean = append(clean, name)
+	}
+
+	if len(clean) == 0 {
+		return "(none)"
+	}
+
+	sort.Strings(clean)
+	return strings.Join(clean, " ")
+}
+
+func framedBlock(lines []string) string {
+	if len(lines) == 0 {
+		return ""
+	}
+
+	maxWidth := 0
+	for _, line := range lines {
+		lineWidth := visibleLen(line)
+		if lineWidth > maxWidth {
+			maxWidth = lineWidth
+		}
+	}
+
+	border := fmt.Sprintf("┌%s┐", strings.Repeat("─", maxWidth+2))
+
+	var builder strings.Builder
+	builder.WriteString(border)
+	builder.WriteString("\n")
+	for _, line := range lines {
+		padding := strings.Repeat(" ", maxWidth-visibleLen(line))
+		builder.WriteString("│ ")
+		builder.WriteString(line)
+		builder.WriteString(padding)
+		builder.WriteString(" │\n")
+	}
+	builder.WriteString(fmt.Sprintf("└%s┘", strings.Repeat("─", maxWidth+2)))
+	builder.WriteString("\n")
+
+	return builder.String()
+}
+
+func visibleLen(text string) int {
+	clean := ansiEscapePattern.ReplaceAllString(text, "")
+	return utf8.RuneCountInString(clean)
+}
+
+func colorizedStatus(status string) string {
+	description := describeStatus(status)
+
+	switch status {
+	case "updated", "up-to-date":
+		return colorize(description, ansiGreen)
+	case "partial", "cancelled":
+		return colorize(description, ansiYellow)
+	case "failed", "error":
+		return colorize(description, ansiRed)
+	default:
+		return description
+	}
+}
+
+func colorizedCount(value int, color string) string {
+	text := fmt.Sprintf("%d", value)
+	if value == 0 {
+		return text
+	}
+
+	return colorize(text, color)
+}
+
+func colorize(text, color string) string {
+	if !colorOutputEnabled || color == "" {
+		return text
+	}
+
+	return color + text + ansiReset
+}
+
+func supportsColorOutput() bool {
+	if strings.TrimSpace(os.Getenv("NO_COLOR")) != "" {
+		return false
+	}
+
+	if strings.TrimSpace(os.Getenv("TERM")) == "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func printIndented(text, indent string) {
