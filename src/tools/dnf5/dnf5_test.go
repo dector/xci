@@ -1,9 +1,11 @@
 package dnf5
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -147,6 +149,143 @@ func TestApplyInstalledVersions(t *testing.T) {
 	}
 	if packages[2].Current != "" {
 		t.Fatalf("expected empty current version for vim, got: %q", packages[2].Current)
+	}
+}
+
+func TestBuildVerifiedUpdateResultsMarksStillOutdatedAsFailure(t *testing.T) {
+	t.Parallel()
+
+	requested := []OutdatedPackage{
+		{Name: "bash", Arch: "x86_64", Latest: "5.2-8.fc41"},
+		{Name: "zlib", Arch: "x86_64", Latest: "1.3-1.fc41"},
+	}
+
+	results := buildVerifiedUpdateResults(
+		requested,
+		"upgrade output",
+		func() ([]OutdatedPackage, string, error) {
+			return []OutdatedPackage{{Name: "bash", Arch: "x86_64", Latest: "5.2-8.fc41"}}, "check output", nil
+		},
+	)
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+
+	if results[0].Success {
+		t.Fatalf("expected bash to be marked failed")
+	}
+	if !strings.Contains(results[0].Reason, "still reported as outdated") {
+		t.Fatalf("expected stale-package reason, got: %q", results[0].Reason)
+	}
+	if !strings.Contains(results[0].Output, "post-upgrade check") {
+		t.Fatalf("expected post-upgrade check output to be included, got: %q", results[0].Output)
+	}
+
+	if !results[1].Success {
+		t.Fatalf("expected zlib to remain successful")
+	}
+}
+
+func TestBuildVerifiedUpdateResultsKeepsSuccessWhenCheckFails(t *testing.T) {
+	t.Parallel()
+
+	requested := []OutdatedPackage{{Name: "bash", Arch: "x86_64", Latest: "5.2-8.fc41"}}
+	results := buildVerifiedUpdateResults(
+		requested,
+		"upgrade output",
+		func() ([]OutdatedPackage, string, error) {
+			return nil, "dnf check output", errors.New("boom")
+		},
+	)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !results[0].Success {
+		t.Fatalf("expected success when post-upgrade check fails")
+	}
+	if !strings.Contains(results[0].Output, "post-upgrade check failed") {
+		t.Fatalf("expected check failure note in output, got: %q", results[0].Output)
+	}
+}
+
+func TestBuildVerifiedUpdateResultsTreatsMatchingCurrentAsSuccess(t *testing.T) {
+	t.Parallel()
+
+	requested := []OutdatedPackage{{Name: "cosmic-app-library", Arch: "x86_64", Latest: "1.0.6-1.fc43"}}
+	results := buildVerifiedUpdateResults(
+		requested,
+		"upgrade output",
+		func() ([]OutdatedPackage, string, error) {
+			return []OutdatedPackage{{
+				Name:    "cosmic-app-library",
+				Arch:    "x86_64",
+				Current: "1.0.6-1.fc43",
+				Latest:  "1.0.6-1.fc43",
+			}}, "check output", nil
+		},
+	)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if !results[0].Success {
+		t.Fatalf("expected matching current/latest to be treated as success, got failure: %q", results[0].Reason)
+	}
+}
+
+func TestVersionsMatch(t *testing.T) {
+	t.Parallel()
+
+	if !versionsMatch("1.0.6-1.fc43", "1.0.6-1.fc43") {
+		t.Fatalf("expected exact versions to match")
+	}
+	if !versionsMatch("0:1.0.6-1.fc43", "1.0.6-1.fc43") {
+		t.Fatalf("expected zero-epoch prefix to be ignored")
+	}
+	if versionsMatch("1.0.5-1.fc43", "1.0.6-1.fc43") {
+		t.Fatalf("expected different versions not to match")
+	}
+}
+
+func TestFormatPostUpgradeCheckOutput(t *testing.T) {
+	t.Parallel()
+
+	got := formatPostUpgradeCheckOutput("some output", nil)
+	if got != "post-upgrade check:\nsome output" {
+		t.Fatalf("unexpected formatted post-upgrade output: %q", got)
+	}
+
+	got = formatPostUpgradeCheckOutput("", errors.New("boom"))
+	if got != "post-upgrade check failed: boom" {
+		t.Fatalf("unexpected formatted check failure output: %q", got)
+	}
+}
+
+func TestUpdateCommandArgs(t *testing.T) {
+	t.Parallel()
+
+	got := updateCommandArgs([]OutdatedPackage{
+		{Name: "bash", Arch: "x86_64"},
+		{Name: "", Arch: "x86_64"},
+		{Name: "zlib", Arch: "i686"},
+		{Name: "bash", Arch: "x86_64"},
+	})
+
+	want := []string{"dnf5", "upgrade", "--refresh", "--best", "-y", "bash.x86_64", "zlib.i686"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected update command args\nwant: %#v\ngot:  %#v", want, got)
+	}
+}
+
+func TestCheckUpgradeCommandArgs(t *testing.T) {
+	t.Parallel()
+
+	got := checkUpgradeCommandArgs("--json")
+	want := []string{"check-upgrade", "--refresh", "--json"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected check-upgrade command args\nwant: %#v\ngot:  %#v", want, got)
 	}
 }
 

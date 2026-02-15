@@ -9,3 +9,7 @@ task build {
 task ai:build {
     cmd "go build -o ./out/xci.ai ./src/main.go"
 }
+
+task install {
+    cmd "ror run self install"
+}

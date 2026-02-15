@@ -65,15 +65,15 @@ func ListOutdated() ([]OutdatedPackage, string, error) {
 	return packages, combinedOutput, nil
 }
 
-// UpdatePackages upgrades all packages in a single dnf5 transaction.
+// UpdatePackages upgrades the selected outdated package specs.
 func UpdatePackages(packages []OutdatedPackage) []PackageUpdateResult {
 	if len(packages) == 0 {
 		return nil
 	}
 
-	args := []string{"dnf5", "upgrade", "-y"}
-	for _, pkg := range packages {
-		args = append(args, packageSpec(pkg.Name, pkg.Arch))
+	args := updateCommandArgs(packages)
+	if len(args) == 5 {
+		return nil
 	}
 
 	var outBuf, errBuf bytes.Buffer
@@ -100,6 +100,111 @@ func UpdatePackages(packages []OutdatedPackage) []PackageUpdateResult {
 		return results
 	}
 
+	return buildVerifiedUpdateResults(packages, output, ListOutdated)
+}
+
+func updateCommandArgs(packages []OutdatedPackage) []string {
+	args := []string{"dnf5", "upgrade", "--refresh", "--best", "-y"}
+	seen := make(map[string]struct{}, len(packages))
+
+	for _, pkg := range packages {
+		spec := packageSpec(pkg.Name, pkg.Arch)
+		if spec == "" {
+			continue
+		}
+		if _, ok := seen[spec]; ok {
+			continue
+		}
+
+		seen[spec] = struct{}{}
+		args = append(args, spec)
+	}
+
+	// fmt.Printf("%+s\n", args)
+
+	return args
+}
+
+func buildVerifiedUpdateResults(
+	packages []OutdatedPackage,
+	upgradeOutput string,
+	listOutdated func() ([]OutdatedPackage, string, error),
+) []PackageUpdateResult {
+	if listOutdated == nil {
+		return buildSuccessfulUpdateResults(packages, upgradeOutput)
+	}
+
+	outdated, checkOutput, err := listOutdated()
+	combinedOutput := combineOutput(upgradeOutput, formatPostUpgradeCheckOutput(checkOutput, err))
+	if err != nil {
+		return buildSuccessfulUpdateResults(packages, combinedOutput)
+	}
+
+	outdatedBySpec := make(map[string]OutdatedPackage, len(outdated))
+	for _, pkg := range outdated {
+		spec := packageSpec(pkg.Name, pkg.Arch)
+		if spec == "" {
+			continue
+		}
+
+		outdatedBySpec[spec] = pkg
+	}
+
+	results := make([]PackageUpdateResult, 0, len(packages))
+	for _, pkg := range packages {
+		spec := packageSpec(pkg.Name, pkg.Arch)
+		outdatedPkg, stillOutdated := outdatedBySpec[spec]
+		if !stillOutdated {
+			results = append(results, PackageUpdateResult{
+				Package: pkg,
+				Success: true,
+				Output:  combinedOutput,
+			})
+			continue
+		}
+
+		if versionsMatch(outdatedPkg.Current, outdatedPkg.Latest) {
+			results = append(results, PackageUpdateResult{
+				Package: pkg,
+				Success: true,
+				Output:  combinedOutput,
+			})
+			continue
+		}
+
+		reason := "still reported as outdated after running dnf5 upgrade"
+		if latest := strings.TrimSpace(outdatedPkg.Latest); latest != "" {
+			reason = fmt.Sprintf("still reported as outdated after running dnf5 upgrade (latest: %s)", latest)
+		}
+
+		results = append(results, PackageUpdateResult{
+			Package: pkg,
+			Success: false,
+			Output:  combinedOutput,
+			Reason:  reason,
+		})
+	}
+
+	return results
+}
+
+func versionsMatch(current, latest string) bool {
+	current = normalizeVersion(current)
+	latest = normalizeVersion(latest)
+	if current == "" || latest == "" {
+		return false
+	}
+
+	return current == latest
+}
+
+func normalizeVersion(value string) string {
+	value = strings.TrimSpace(value)
+	return strings.TrimPrefix(value, "0:")
+}
+
+func buildSuccessfulUpdateResults(packages []OutdatedPackage, output string) []PackageUpdateResult {
+	results := make([]PackageUpdateResult, 0, len(packages))
 	for _, pkg := range packages {
 		results = append(results, PackageUpdateResult{
 			Package: pkg,
@@ -109,6 +214,23 @@ func UpdatePackages(packages []OutdatedPackage) []PackageUpdateResult {
 	}
 
 	return results
+}
+
+func formatPostUpgradeCheckOutput(output string, err error) string {
+	output = strings.TrimSpace(output)
+	if err != nil {
+		if output == "" {
+			return fmt.Sprintf("post-upgrade check failed: %v", err)
+		}
+
+		return fmt.Sprintf("post-upgrade check failed: %v\n%s", err, output)
+	}
+
+	if output == "" {
+		return ""
+	}
+
+	return fmt.Sprintf("post-upgrade check:\n%s", output)
 }
 
 func parseCheckUpgradeJSON(output string) ([]OutdatedPackage, error) {
@@ -374,8 +496,7 @@ func buildListOutdatedError(err error, output string) error {
 }
 
 func runCheckUpgrade(args ...string) (string, string, error) {
-	cmdArgs := []string{"check-upgrade"}
-	cmdArgs = append(cmdArgs, args...)
+	cmdArgs := checkUpgradeCommandArgs(args...)
 
 	var outBuf, errBuf bytes.Buffer
 	cmd := exec.Command("dnf5", cmdArgs...)
@@ -387,6 +508,12 @@ func runCheckUpgrade(args ...string) (string, string, error) {
 	stderr := strings.TrimSpace(errBuf.String())
 
 	return stdout, stderr, err
+}
+
+func checkUpgradeCommandArgs(args ...string) []string {
+	cmdArgs := []string{"check-upgrade", "--refresh"}
+	cmdArgs = append(cmdArgs, args...)
+	return cmdArgs
 }
 
 func stripANSIColors(text string) string {
@@ -409,6 +536,10 @@ func splitPackageSpec(spec string) (string, string, bool) {
 
 func packageSpec(name, arch string) string {
 	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+
 	arch = strings.TrimSpace(arch)
 	if arch == "" {
 		return name
