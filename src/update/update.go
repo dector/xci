@@ -93,7 +93,7 @@ type progressReporter interface {
 }
 
 func Run() error {
-	fmt.Println("Checking for available updates...")
+	fmt.Println(colorize("Checking for available updates...", ansiBoldCyan))
 
 	plans := collectUpdatePlansWithProgress()
 	printUpdatePlanSections(plans)
@@ -126,7 +126,7 @@ func Run() error {
 		return nil
 	}
 
-	fmt.Println("\nApplying updates...")
+	fmt.Println(colorize("\nApplying updates...", ansiBoldCyan))
 	summaries := executeUpdates(plans)
 	printUpdateSummarySections(summaries)
 
@@ -413,14 +413,14 @@ func printUpdatePlanSections(plans []toolUpdatePlan) {
 		}
 
 		if len(plan.Packages) == 0 {
-			fmt.Println("No packages need an update.")
+			fmt.Println(colorize("No packages need an update.", ansiYellow))
 			continue
 		}
 
-		fmt.Printf("%d package(s) can be updated:\n", len(plan.Packages))
+		fmt.Printf("%s package(s) can be updated:\n", colorizedCount(len(plan.Packages), ansiGreen))
 
 		for idx, pkg := range plan.Packages {
-			fmt.Printf("%d. %s\n", idx+1, describePackagePlanLine(pkg))
+			fmt.Printf("%s %s\n", colorize(fmt.Sprintf("%d.", idx+1), ansiBoldCyan), colorize(describePackagePlanLine(pkg), ansiGreen))
 		}
 	}
 }
@@ -549,20 +549,20 @@ func printUpdateSummarySections(summaries []toolUpdateSummary) {
 		totalFailed += summary.FailedPackages
 
 		fmt.Printf("\n%s\n", colorize(fmt.Sprintf("[%s]", summary.ToolName), ansiBlue))
-		fmt.Printf("Result: %s\n", colorizedStatus(summary.Status))
-		fmt.Printf("Updated: %s\n", colorizedCount(summary.UpdatedPackages, ansiGreen))
-		fmt.Printf("Failed: %s\n", colorizedCount(summary.FailedPackages, ansiRed))
+		fmt.Printf("%s %s\n", colorize("Result:", ansiBoldCyan), colorizedStatus(summary.Status))
+		fmt.Printf("%s %s\n", colorize("Updated:", ansiBoldCyan), colorizedCount(summary.UpdatedPackages, ansiGreen))
+		fmt.Printf("%s %s\n", colorize("Failed:", ansiBoldCyan), colorizedCount(summary.FailedPackages, ansiRed))
 
 		if len(summary.FailureReasons) > 0 {
 			fmt.Println(colorize("Failure reasons:", ansiRed))
 			for _, reason := range summary.FailureReasons {
-				fmt.Printf("- %s\n", reason)
+				fmt.Printf("- %s\n", colorize(reason, ansiRed))
 			}
 		}
 
-		fmt.Println(colorize("Output:", ansiBlue))
+		fmt.Println(colorize("Output:", ansiBoldCyan))
 		if strings.TrimSpace(summary.Output) == "" {
-			fmt.Println("(no output captured)")
+			fmt.Println(colorize("(no output captured)", ansiYellow))
 			continue
 		}
 
@@ -574,7 +574,7 @@ func printUpdateSummarySections(summaries []toolUpdateSummary) {
 }
 
 func askUserConfirmation(prompt string) (bool, error) {
-	fmt.Printf("%s [y/N]: ", prompt)
+	fmt.Printf("%s %s: ", colorize(prompt, ansiBoldCyan), colorize("[y/N]", ansiYellow))
 
 	reader := bufio.NewReader(os.Stdin)
 	response, err := reader.ReadString('\n')
