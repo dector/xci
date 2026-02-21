@@ -36,6 +36,7 @@ const (
 	ansiYellow   = "\033[33m"
 	ansiRed      = "\033[31m"
 	ansiBoldCyan = "\033[1;36m"
+	ansiDim      = "\033[2m"
 
 	defaultTerminalColumns = 80
 	frameHorizontalPadding = 4
@@ -49,6 +50,7 @@ type toolUpdatePlan struct {
 	Packages     []updatePackage
 	RunUpdate    func([]updatePackage) []packageUpdateResult
 	CollectError error
+	Skipped      bool
 }
 
 type updatePackage struct {
@@ -69,6 +71,7 @@ type toolBackend struct {
 	Name          string
 	ListOutdated  func() ([]updatePackage, string, error)
 	UpdatePackage func([]updatePackage) []packageUpdateResult
+	Skipped       bool
 }
 
 type toolUpdateSummary struct {
@@ -92,10 +95,17 @@ type progressReporter interface {
 	MarkDone(index, packages int)
 }
 
-func Run() error {
+func Run(args []string) error {
+	availableBackends := registeredBackends()
+	selectedBackends, err := selectBackends(args, availableBackends)
+	if err != nil {
+		return err
+	}
+	displayBackends := backendsWithSkipped(availableBackends, selectedBackends)
+
 	fmt.Println(colorize("Checking for available updates...", ansiBoldCyan))
 
-	plans := collectUpdatePlansWithProgress()
+	plans := nonSkippedPlans(collectUpdatePlansWithProgress(displayBackends))
 	printUpdatePlanSections(plans)
 
 	if hasCollectionFailures(plans) {
@@ -139,8 +149,7 @@ func Run() error {
 	return nil
 }
 
-func collectUpdatePlansWithProgress() []toolUpdatePlan {
-	backends := registeredBackends()
+func collectUpdatePlansWithProgress(backends []toolBackend) []toolUpdatePlan {
 	reporter := newUpdateProgressRenderer(backends, progressOutputWriter, supportsInPlaceProgressOutput())
 
 	return collectUpdatePlansWithProgressForBackends(backends, reporter)
@@ -157,7 +166,14 @@ func collectUpdatePlansWithProgressForBackends(backends []toolBackend, reporter 
 	}
 
 	results := make(chan updateCollectResult, len(backends))
+	completed := 0
 	for idx, backend := range backends {
+		if backend.Skipped {
+			plans[idx] = toolUpdatePlan{ToolName: backend.Name, Skipped: true}
+			completed++
+			continue
+		}
+
 		go func(index int, backend toolBackend) {
 			packages, output, err := backend.ListOutdated()
 			results <- updateCollectResult{
@@ -176,7 +192,7 @@ func collectUpdatePlansWithProgressForBackends(backends []toolBackend, reporter 
 	ticker := time.NewTicker(loaderTickInterval)
 	defer ticker.Stop()
 
-	for completed := 0; completed < len(backends); {
+	for completed < len(backends) {
 		select {
 		case result := <-results:
 			plans[result.index] = result.plan
@@ -194,6 +210,19 @@ func collectUpdatePlansWithProgressForBackends(backends []toolBackend, reporter 
 	return plans
 }
 
+func nonSkippedPlans(plans []toolUpdatePlan) []toolUpdatePlan {
+	filtered := make([]toolUpdatePlan, 0, len(plans))
+	for _, plan := range plans {
+		if plan.Skipped {
+			continue
+		}
+
+		filtered = append(filtered, plan)
+	}
+
+	return filtered
+}
+
 func registeredBackends() []toolBackend {
 	backends := []toolBackend{
 		miseBackend(),
@@ -205,6 +234,144 @@ func registeredBackends() []toolBackend {
 	}
 
 	return backends
+}
+
+func selectBackends(args []string, available []toolBackend) ([]toolBackend, error) {
+	selection, err := parseUpdateSelection(args)
+	if err != nil {
+		return nil, err
+	}
+
+	availableByName := make(map[string]toolBackend, len(available))
+	for _, backend := range available {
+		availableByName[backend.Name] = backend
+	}
+
+	selected := make(map[string]struct{}, len(available))
+	if selection.includeAll || len(selection.includeNames) == 0 {
+		for _, backend := range available {
+			selected[backend.Name] = struct{}{}
+		}
+	} else {
+		for name := range selection.includeNames {
+			if _, ok := availableByName[name]; !ok {
+				return nil, fmt.Errorf("%s update subsystem is not available on this system", displaySubsystemName(name))
+			}
+
+			selected[name] = struct{}{}
+		}
+	}
+
+	for name := range selection.excludeNames {
+		delete(selected, name)
+	}
+
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("no update subsystems selected")
+	}
+
+	filtered := make([]toolBackend, 0, len(selected))
+	for _, backend := range available {
+		if _, ok := selected[backend.Name]; !ok {
+			continue
+		}
+
+		filtered = append(filtered, backend)
+	}
+
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("no update subsystems selected")
+	}
+
+	return filtered, nil
+}
+
+func backendsWithSkipped(available, selected []toolBackend) []toolBackend {
+	selectedByName := make(map[string]struct{}, len(selected))
+	for _, backend := range selected {
+		selectedByName[backend.Name] = struct{}{}
+	}
+
+	display := make([]toolBackend, 0, len(available))
+	for _, backend := range available {
+		displayBackend := backend
+		if _, ok := selectedByName[backend.Name]; !ok {
+			displayBackend.Skipped = true
+		}
+
+		display = append(display, displayBackend)
+	}
+
+	return display
+}
+
+type updateSelection struct {
+	includeAll   bool
+	includeNames map[string]struct{}
+	excludeNames map[string]struct{}
+}
+
+func parseUpdateSelection(args []string) (updateSelection, error) {
+	selection := updateSelection{
+		includeNames: make(map[string]struct{}),
+		excludeNames: make(map[string]struct{}),
+	}
+
+	for _, rawToken := range args {
+		token := strings.ToLower(strings.TrimSpace(rawToken))
+		if token == "" {
+			continue
+		}
+
+		if token == "all" {
+			selection.includeAll = true
+			continue
+		}
+
+		if strings.HasPrefix(token, "no-") {
+			subsystem, ok := normalizeSubsystemToken(strings.TrimPrefix(token, "no-"))
+			if !ok {
+				return updateSelection{}, invalidUpdateSelectionError(rawToken)
+			}
+
+			selection.excludeNames[subsystem] = struct{}{}
+			continue
+		}
+
+		subsystem, ok := normalizeSubsystemToken(token)
+		if !ok {
+			return updateSelection{}, invalidUpdateSelectionError(rawToken)
+		}
+
+		selection.includeNames[subsystem] = struct{}{}
+	}
+
+	return selection, nil
+}
+
+func normalizeSubsystemToken(token string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "mise":
+		return "mise", true
+	case "flatpak":
+		return "flatpak", true
+	case "dnf", "dnf5":
+		return "dnf5", true
+	default:
+		return "", false
+	}
+}
+
+func displaySubsystemName(name string) string {
+	if name == "dnf5" {
+		return "dnf"
+	}
+
+	return name
+}
+
+func invalidUpdateSelectionError(token string) error {
+	return fmt.Errorf("unknown update selector %q (allowed: all, mise, flatpak, dnf, no-mise, no-flatpak, no-dnf)", token)
 }
 
 func shouldIncludeDNF5Backend() bool {
@@ -222,6 +389,7 @@ func shouldIncludeDNF5Backend() bool {
 
 type updateProgressRow struct {
 	toolName     string
+	skipped      bool
 	done         bool
 	packageCount int
 	startedAt    time.Time
@@ -239,7 +407,11 @@ func newUpdateProgressRenderer(backends []toolBackend, writer io.Writer, inPlace
 	nowFunc := time.Now
 	rows := make([]updateProgressRow, 0, len(backends))
 	for _, backend := range backends {
-		rows = append(rows, updateProgressRow{toolName: backend.Name, startedAt: nowFunc()})
+		rows = append(rows, updateProgressRow{
+			toolName:  backend.Name,
+			skipped:   backend.Skipped,
+			startedAt: nowFunc(),
+		})
 	}
 
 	if writer == nil {
@@ -295,6 +467,10 @@ func (r *updateProgressRenderer) lineForRow(index int) string {
 	}
 
 	row := r.rows[index]
+	if row.skipped {
+		return colorizedSkippedLoaderLine(row.toolName)
+	}
+
 	if row.done {
 		return colorizedDoneLoaderLine(row.toolName, row.packageCount)
 	}
@@ -356,6 +532,10 @@ func colorizedDoneLoaderLine(toolName string, packages int) string {
 		colorize("["+toolName+"]", ansiBlue),
 		colorize(fmt.Sprintf("%d found", packages), ansiGreen),
 	)
+}
+
+func colorizedSkippedLoaderLine(toolName string) string {
+	return colorize(fmt.Sprintf("[%s] skipped", toolName), ansiDim)
 }
 
 func miseBackend() toolBackend {

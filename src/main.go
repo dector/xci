@@ -40,7 +40,7 @@ func main() {
 		}
 
 	case "update", "up":
-		if err := updatecmd.Run(); err != nil {
+		if err := updatecmd.Run(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error updating: %v\n", err)
 			os.Exit(1)
 		}

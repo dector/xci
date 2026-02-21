@@ -106,6 +106,97 @@ func containsName(names []string, needle string) bool {
 	return false
 }
 
+func TestSelectBackends(t *testing.T) {
+	t.Parallel()
+
+	available := []toolBackend{
+		{Name: "mise"},
+		{Name: "flatpak"},
+		{Name: "dnf5"},
+	}
+
+	testCases := []struct {
+		name    string
+		args    []string
+		want    []string
+		wantErr string
+	}{
+		{name: "default all", args: nil, want: []string{"mise", "flatpak", "dnf5"}},
+		{name: "all keyword", args: []string{"all"}, want: []string{"mise", "flatpak", "dnf5"}},
+		{name: "single subsystem", args: []string{"mise"}, want: []string{"mise"}},
+		{name: "multiple subsystems", args: []string{"mise", "flatpak"}, want: []string{"mise", "flatpak"}},
+		{name: "exclude from all", args: []string{"no-mise"}, want: []string{"flatpak", "dnf5"}},
+		{name: "all with exclusion", args: []string{"all", "no-mise"}, want: []string{"flatpak", "dnf5"}},
+		{name: "include and exclude", args: []string{"mise", "flatpak", "no-mise"}, want: []string{"flatpak"}},
+		{name: "dnf alias", args: []string{"dnf"}, want: []string{"dnf5"}},
+		{name: "dnf5 alias", args: []string{"dnf5"}, want: []string{"dnf5"}},
+		{name: "invalid selector", args: []string{"foo"}, wantErr: "unknown update selector"},
+		{name: "invalid no-selector", args: []string{"no-foo"}, wantErr: "unknown update selector"},
+		{name: "empty selection", args: []string{"mise", "no-mise"}, wantErr: "no update subsystems selected"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := selectBackends(tc.args, available)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("unexpected error\nwant contains: %q\ngot: %q", tc.wantErr, err.Error())
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("selectBackends returned error: %v", err)
+			}
+
+			gotNames := backendNames(got)
+			if !reflect.DeepEqual(gotNames, tc.want) {
+				t.Fatalf("unexpected selected backends\nwant: %#v\ngot:  %#v", tc.want, gotNames)
+			}
+		})
+	}
+}
+
+func TestSelectBackendsErrorsWhenRequestedBackendUnavailable(t *testing.T) {
+	t.Parallel()
+
+	available := []toolBackend{{Name: "mise"}, {Name: "flatpak"}}
+	_, err := selectBackends([]string{"dnf"}, available)
+	if err == nil {
+		t.Fatalf("expected unavailable backend error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "dnf update subsystem is not available") {
+		t.Fatalf("unexpected unavailable backend error: %q", err.Error())
+	}
+}
+
+func TestBackendsWithSkipped(t *testing.T) {
+	t.Parallel()
+
+	available := []toolBackend{{Name: "mise"}, {Name: "flatpak"}, {Name: "dnf5"}}
+	selected := []toolBackend{{Name: "flatpak"}}
+
+	got := backendsWithSkipped(available, selected)
+	if len(got) != 3 {
+		t.Fatalf("unexpected backend count: %d", len(got))
+	}
+
+	if got[0].Name != "mise" || !got[0].Skipped {
+		t.Fatalf("expected mise backend to be marked skipped, got: %#v", got[0])
+	}
+	if got[1].Name != "flatpak" || got[1].Skipped {
+		t.Fatalf("expected flatpak backend to be selected, got: %#v", got[1])
+	}
+	if got[2].Name != "dnf5" || !got[2].Skipped {
+		t.Fatalf("expected dnf5 backend to be marked skipped, got: %#v", got[2])
+	}
+}
+
 func TestCollectUpdatePlansWithProgressPreservesBackendOrder(t *testing.T) {
 	t.Parallel()
 
@@ -262,6 +353,32 @@ func TestUpdateProgressRendererNonInteractiveFallback(t *testing.T) {
 
 	if strings.Contains(got, "\x1b[") {
 		t.Fatalf("expected fallback mode to avoid ANSI control sequences, got: %q", got)
+	}
+}
+
+func TestUpdateProgressRendererShowsSkippedRows(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	renderer := newUpdateProgressRenderer(
+		[]toolBackend{{Name: "mise", Skipped: true}, {Name: "flatpak"}},
+		&output,
+		false,
+	)
+
+	renderer.Start()
+	renderer.AdvanceFrame()
+	renderer.MarkDone(1, 2)
+
+	got := output.String()
+	want := strings.Join([]string{
+		"[mise] skipped",
+		"Ooo [flatpak] checking...",
+		"[flatpak] 2 found",
+	}, "\n") + "\n"
+
+	if got != want {
+		t.Fatalf("unexpected skipped renderer output\nwant: %q\ngot:  %q", want, got)
 	}
 }
 
