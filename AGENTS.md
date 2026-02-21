@@ -108,6 +108,12 @@ Guidance for coding agents operating in this repository.
 - For preview/plan commands, capture output when confirmation is needed.
 - Keep user prompts concise and deterministic (`y/n` style used in repo).
 
+### CLI color output
+
+- Gate ANSI colors on terminal support and `NO_COLOR`.
+- Keep a plain-text fallback for non-interactive output (pipes/CI/tests).
+- Reuse package color helpers/constants; avoid inline escape sequences.
+
 ### File system safety
 
 - Prefer atomic file replacement patterns for installs/updates:
