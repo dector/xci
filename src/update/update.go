@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 	"xci/internal/utils"
 	"xci/src/tools/dnf5"
@@ -18,11 +20,13 @@ import (
 )
 
 var (
-	lookPathFunc           = exec.LookPath
-	detectDistroFamilyFunc = utils.DetectDistroFamily
-	terminalColumnsFunc    = detectTerminalColumns
-	colorOutputEnabled     = supportsColorOutput()
-	ansiEscapePattern      = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	lookPathFunc                     = exec.LookPath
+	detectDistroFamilyFunc           = utils.DetectDistroFamily
+	terminalColumnsFunc              = detectTerminalColumns
+	progressOutputWriter   io.Writer = os.Stdout
+	colorOutputEnabled               = supportsColorOutput()
+	ansiEscapePattern                = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	loaderFrames                     = []string{"Ooo", "oOo", "ooO"}
 )
 
 const (
@@ -35,6 +39,8 @@ const (
 
 	defaultTerminalColumns = 80
 	frameHorizontalPadding = 4
+	loaderTickInterval     = 150 * time.Millisecond
+	loaderThirdFrameDelay  = 500 * time.Millisecond
 )
 
 type toolUpdatePlan struct {
@@ -75,10 +81,21 @@ type toolUpdateSummary struct {
 	FailureReasons  []string
 }
 
+type updateCollectResult struct {
+	index int
+	plan  toolUpdatePlan
+}
+
+type progressReporter interface {
+	Start()
+	AdvanceFrame()
+	MarkDone(index, packages int)
+}
+
 func Run() error {
 	fmt.Println("Checking for available updates...")
 
-	plans := collectUpdatePlans()
+	plans := collectUpdatePlansWithProgress()
 	printUpdatePlanSections(plans)
 
 	if hasCollectionFailures(plans) {
@@ -122,19 +139,56 @@ func Run() error {
 	return nil
 }
 
-func collectUpdatePlans() []toolUpdatePlan {
+func collectUpdatePlansWithProgress() []toolUpdatePlan {
 	backends := registeredBackends()
+	reporter := newUpdateProgressRenderer(backends, progressOutputWriter, supportsInPlaceProgressOutput())
 
-	plans := make([]toolUpdatePlan, 0, len(backends))
-	for _, backend := range backends {
-		packages, output, err := backend.ListOutdated()
-		plans = append(plans, toolUpdatePlan{
-			ToolName:     backend.Name,
-			ListOutput:   output,
-			Packages:     packages,
-			RunUpdate:    backend.UpdatePackage,
-			CollectError: err,
-		})
+	return collectUpdatePlansWithProgressForBackends(backends, reporter)
+}
+
+func collectUpdatePlansWithProgressForBackends(backends []toolBackend, reporter progressReporter) []toolUpdatePlan {
+	plans := make([]toolUpdatePlan, len(backends))
+	if len(backends) == 0 {
+		return plans
+	}
+
+	if reporter != nil {
+		reporter.Start()
+	}
+
+	results := make(chan updateCollectResult, len(backends))
+	for idx, backend := range backends {
+		go func(index int, backend toolBackend) {
+			packages, output, err := backend.ListOutdated()
+			results <- updateCollectResult{
+				index: index,
+				plan: toolUpdatePlan{
+					ToolName:     backend.Name,
+					ListOutput:   output,
+					Packages:     packages,
+					RunUpdate:    backend.UpdatePackage,
+					CollectError: err,
+				},
+			}
+		}(idx, backend)
+	}
+
+	ticker := time.NewTicker(loaderTickInterval)
+	defer ticker.Stop()
+
+	for completed := 0; completed < len(backends); {
+		select {
+		case result := <-results:
+			plans[result.index] = result.plan
+			if reporter != nil {
+				reporter.MarkDone(result.index, len(result.plan.Packages))
+			}
+			completed++
+		case <-ticker.C:
+			if reporter != nil {
+				reporter.AdvanceFrame()
+			}
+		}
 	}
 
 	return plans
@@ -164,6 +218,144 @@ func shouldIncludeDNF5Backend() bool {
 	}
 
 	return detectDistroFamilyFunc() == utils.DistroFamilyFedoraLike
+}
+
+type updateProgressRow struct {
+	toolName     string
+	done         bool
+	packageCount int
+	startedAt    time.Time
+}
+
+type updateProgressRenderer struct {
+	writer     io.Writer
+	rows       []updateProgressRow
+	frameIndex int
+	inPlace    bool
+	nowFunc    func() time.Time
+}
+
+func newUpdateProgressRenderer(backends []toolBackend, writer io.Writer, inPlace bool) *updateProgressRenderer {
+	nowFunc := time.Now
+	rows := make([]updateProgressRow, 0, len(backends))
+	for _, backend := range backends {
+		rows = append(rows, updateProgressRow{toolName: backend.Name, startedAt: nowFunc()})
+	}
+
+	if writer == nil {
+		writer = io.Discard
+	}
+
+	return &updateProgressRenderer{
+		writer:  writer,
+		rows:    rows,
+		inPlace: inPlace,
+		nowFunc: nowFunc,
+	}
+}
+
+func (r *updateProgressRenderer) Start() {
+	for idx := range r.rows {
+		fmt.Fprintln(r.writer, r.lineForRow(idx))
+	}
+}
+
+func (r *updateProgressRenderer) AdvanceFrame() {
+	if len(loaderFrames) == 0 {
+		return
+	}
+
+	r.frameIndex = (r.frameIndex + 1) % len(loaderFrames)
+	if !r.inPlace {
+		return
+	}
+
+	r.redrawAllRows()
+}
+
+func (r *updateProgressRenderer) MarkDone(index, packages int) {
+	if index < 0 || index >= len(r.rows) {
+		return
+	}
+
+	r.rows[index].done = true
+	r.rows[index].packageCount = packages
+
+	if r.inPlace {
+		r.redrawAllRows()
+		return
+	}
+
+	fmt.Fprintln(r.writer, r.lineForRow(index))
+}
+
+func (r *updateProgressRenderer) lineForRow(index int) string {
+	if index < 0 || index >= len(r.rows) {
+		return ""
+	}
+
+	row := r.rows[index]
+	if row.done {
+		return colorizedDoneLoaderLine(row.toolName, row.packageCount)
+	}
+
+	if len(loaderFrames) == 0 {
+		return colorizedCheckingLoaderLine("", row.toolName)
+	}
+
+	frame := loaderFrames[r.frameIndex]
+	if frame == "ooO" {
+		elapsed := r.nowFunc().Sub(row.startedAt)
+		if elapsed < loaderThirdFrameDelay {
+			frame = "oOo"
+		}
+	}
+
+	return colorizedCheckingLoaderLine(frame, row.toolName)
+}
+
+func (r *updateProgressRenderer) redrawAllRows() {
+	if len(r.rows) == 0 {
+		return
+	}
+
+	fmt.Fprintf(r.writer, "\033[%dA", len(r.rows))
+	for idx := range r.rows {
+		fmt.Fprintf(r.writer, "\r\033[2K%s\n", r.lineForRow(idx))
+	}
+}
+
+func formatCheckingLoaderLine(frame, toolName string) string {
+	frame = strings.TrimSpace(frame)
+	if frame == "" {
+		frame = "Ooo"
+	}
+
+	return fmt.Sprintf("%s [%s] checking...", frame, toolName)
+}
+
+func formatDoneLoaderLine(toolName string, packages int) string {
+	return fmt.Sprintf("[%s] %d found", toolName, packages)
+}
+
+func colorizedCheckingLoaderLine(frame, toolName string) string {
+	plainFrame := strings.TrimSpace(frame)
+	if plainFrame == "" {
+		plainFrame = "Ooo"
+	}
+
+	return fmt.Sprintf("%s %s %s",
+		colorize(plainFrame, ansiBoldCyan),
+		colorize("["+toolName+"]", ansiBlue),
+		colorize("checking...", ansiYellow),
+	)
+}
+
+func colorizedDoneLoaderLine(toolName string, packages int) string {
+	return fmt.Sprintf("%s %s",
+		colorize("["+toolName+"]", ansiBlue),
+		colorize(fmt.Sprintf("%d found", packages), ansiGreen),
+	)
 }
 
 func miseBackend() toolBackend {
@@ -843,6 +1035,19 @@ func colorize(text, color string) string {
 	}
 
 	return color + text + ansiReset
+}
+
+func supportsInPlaceProgressOutput() bool {
+	if strings.TrimSpace(os.Getenv("TERM")) == "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func supportsColorOutput() bool {

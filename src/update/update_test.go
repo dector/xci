@@ -1,11 +1,13 @@
 package update
 
 import (
+	"bytes"
 	"errors"
 	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"xci/internal/utils"
 	"xci/src/tools/dnf5"
 )
@@ -102,6 +104,165 @@ func containsName(names []string, needle string) bool {
 	}
 
 	return false
+}
+
+func TestCollectUpdatePlansWithProgressPreservesBackendOrder(t *testing.T) {
+	t.Parallel()
+
+	backends := []toolBackend{
+		{
+			Name: "mise",
+			ListOutdated: func() ([]updatePackage, string, error) {
+				time.Sleep(50 * time.Millisecond)
+				return []updatePackage{{Name: "node"}}, "mise output", nil
+			},
+		},
+		{
+			Name: "flatpak",
+			ListOutdated: func() ([]updatePackage, string, error) {
+				time.Sleep(10 * time.Millisecond)
+				return []updatePackage{{Name: "org.mozilla.firefox"}}, "flatpak output", nil
+			},
+		},
+		{
+			Name: "dnf5",
+			ListOutdated: func() ([]updatePackage, string, error) {
+				time.Sleep(20 * time.Millisecond)
+				return []updatePackage{{Name: "bash.x86_64"}}, "dnf5 output", nil
+			},
+		},
+	}
+
+	plans := collectUpdatePlansWithProgressForBackends(backends, nil)
+
+	gotOrder := make([]string, 0, len(plans))
+	for _, plan := range plans {
+		gotOrder = append(gotOrder, plan.ToolName)
+	}
+
+	wantOrder := []string{"mise", "flatpak", "dnf5"}
+	if !reflect.DeepEqual(gotOrder, wantOrder) {
+		t.Fatalf("unexpected plan order\nwant: %#v\ngot:  %#v", wantOrder, gotOrder)
+	}
+}
+
+func TestFormatCheckingLoaderLine(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name  string
+		frame string
+		tool  string
+		want  string
+	}{
+		{name: "mise", frame: "Ooo", tool: "mise", want: "Ooo [mise] checking..."},
+		{name: "flatpak", frame: "oOo", tool: "flatpak", want: "oOo [flatpak] checking..."},
+		{name: "dnf5", frame: "ooO", tool: "dnf5", want: "ooO [dnf5] checking..."},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatCheckingLoaderLine(tc.frame, tc.tool); got != tc.want {
+				t.Fatalf("unexpected checking line\nwant: %q\ngot:  %q", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestFormatDoneLoaderLine(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name  string
+		tool  string
+		count int
+		want  string
+	}{
+		{name: "mise", tool: "mise", count: 1, want: "[mise] 1 found"},
+		{name: "flatpak", tool: "flatpak", count: 7, want: "[flatpak] 7 found"},
+		{name: "dnf5", tool: "dnf5", count: 0, want: "[dnf5] 0 found"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatDoneLoaderLine(tc.tool, tc.count); got != tc.want {
+				t.Fatalf("unexpected done line\nwant: %q\ngot:  %q", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestUpdateProgressRendererDoneStateFreezesLine(t *testing.T) {
+	t.Parallel()
+
+	renderer := newUpdateProgressRenderer([]toolBackend{{Name: "mise"}}, &bytes.Buffer{}, true)
+
+	if got := renderer.lineForRow(0); got != "Ooo [mise] checking..." {
+		t.Fatalf("unexpected initial renderer line: %q", got)
+	}
+
+	renderer.AdvanceFrame()
+	if got := renderer.lineForRow(0); got != "oOo [mise] checking..." {
+		t.Fatalf("unexpected animated renderer line: %q", got)
+	}
+
+	renderer.MarkDone(0, 2)
+	if got := renderer.lineForRow(0); got != "[mise] 2 found" {
+		t.Fatalf("unexpected done renderer line: %q", got)
+	}
+
+	renderer.AdvanceFrame()
+	if got := renderer.lineForRow(0); got != "[mise] 2 found" {
+		t.Fatalf("done line should stay frozen, got: %q", got)
+	}
+}
+
+func TestUpdateProgressRendererDefersThirdFrameUntilDelay(t *testing.T) {
+	t.Parallel()
+
+	renderer := newUpdateProgressRenderer([]toolBackend{{Name: "mise"}}, &bytes.Buffer{}, true)
+	now := time.Now()
+	renderer.nowFunc = func() time.Time { return now }
+	renderer.rows[0].startedAt = now.Add(-300 * time.Millisecond)
+	renderer.frameIndex = 2
+
+	if got := renderer.lineForRow(0); got != "oOo [mise] checking..." {
+		t.Fatalf("expected third frame to be deferred before delay, got: %q", got)
+	}
+
+	renderer.rows[0].startedAt = now.Add(-700 * time.Millisecond)
+	if got := renderer.lineForRow(0); got != "ooO [mise] checking..." {
+		t.Fatalf("expected third frame to appear after delay, got: %q", got)
+	}
+}
+
+func TestUpdateProgressRendererNonInteractiveFallback(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	renderer := newUpdateProgressRenderer([]toolBackend{{Name: "mise"}, {Name: "flatpak"}}, &output, false)
+
+	renderer.Start()
+	renderer.AdvanceFrame()
+	renderer.MarkDone(1, 3)
+	renderer.AdvanceFrame()
+	renderer.MarkDone(0, 1)
+
+	got := output.String()
+	want := strings.Join([]string{
+		"Ooo [mise] checking...",
+		"Ooo [flatpak] checking...",
+		"[flatpak] 3 found",
+		"[mise] 1 found",
+	}, "\n") + "\n"
+
+	if got != want {
+		t.Fatalf("unexpected non-interactive renderer output\nwant: %q\ngot:  %q", want, got)
+	}
+
+	if strings.Contains(got, "\x1b[") {
+		t.Fatalf("expected fallback mode to avoid ANSI control sequences, got: %q", got)
+	}
 }
 
 func TestFormatUpdatedNames(t *testing.T) {
