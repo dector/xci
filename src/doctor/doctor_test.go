@@ -1,9 +1,11 @@
 package doctor
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os/exec"
+	"strings"
 	"testing"
 	"xci/internal/utils"
 )
@@ -117,4 +119,40 @@ func setDoctorDeps(t *testing.T, lookPath func(string) (string, error), detectFa
 		detectDistroFamilyFunc = originalDetect
 		outWriter = originalOutWriter
 	})
+}
+
+func TestColorizeDisabledReturnsPlainText(t *testing.T) {
+	original := colorOutputEnabled
+	colorOutputEnabled = false
+	t.Cleanup(func() {
+		colorOutputEnabled = original
+	})
+
+	if got := colorize("hello", ansiGreen); got != "hello" {
+		t.Fatalf("unexpected plain colorized value: %q", got)
+	}
+}
+
+func TestRunChecksNoANSIWhenColorDisabled(t *testing.T) {
+	originalColor := colorOutputEnabled
+	colorOutputEnabled = false
+	t.Cleanup(func() {
+		colorOutputEnabled = originalColor
+	})
+
+	originalOut := outWriter
+	var output bytes.Buffer
+	outWriter = &output
+	t.Cleanup(func() {
+		outWriter = originalOut
+	})
+
+	runChecks([]func() DoctorResult{
+		func() DoctorResult { return DoctorResult{Status: statusOK, Message: "mise is installed"} },
+	})
+
+	got := output.String()
+	if strings.Contains(got, "\x1b[") {
+		t.Fatalf("expected no ANSI escapes in output, got: %q", got)
+	}
 }

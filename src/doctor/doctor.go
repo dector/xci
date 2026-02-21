@@ -21,12 +21,18 @@ const (
 	statusOK      doctorStatus = "ok"
 	statusWarning doctorStatus = "warning"
 	statusError   doctorStatus = "error"
+
+	ansiReset  = "\033[0m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+	ansiRed    = "\033[31m"
 )
 
 var (
 	lookPathFunc                     = exec.LookPath
 	detectDistroFamilyFunc           = utils.DetectDistroFamily
 	outWriter              io.Writer = os.Stdout
+	colorOutputEnabled               = supportsColorOutput()
 )
 
 func Run() bool {
@@ -40,32 +46,50 @@ func Run() bool {
 }
 
 func runChecks(checks []func() DoctorResult) bool {
-
-	const (
-		green  = "\033[32m"
-		yellow = "\033[33m"
-		red    = "\033[31m"
-		reset  = "\033[0m"
-	)
-
 	hasErrors := false
 	for _, check := range checks {
 		result := check()
 		switch result.Status {
 		case statusOK:
-			fmt.Fprintf(outWriter, "%s✓ %s%s\n", green, result.Message, reset)
+			fmt.Fprintln(outWriter, colorize("✓ "+result.Message, ansiGreen))
 		case statusWarning:
-			fmt.Fprintf(outWriter, "%s! %s%s\n", yellow, result.Message, reset)
+			fmt.Fprintln(outWriter, colorize("! "+result.Message, ansiYellow))
 		case statusError:
 			hasErrors = true
-			fmt.Fprintf(outWriter, "%s✗ %s%s\n", red, result.Message, reset)
+			fmt.Fprintln(outWriter, colorize("✗ "+result.Message, ansiRed))
 		default:
 			hasErrors = true
-			fmt.Fprintf(outWriter, "%s✗ %s%s\n", red, result.Message, reset)
+			fmt.Fprintln(outWriter, colorize("✗ "+result.Message, ansiRed))
 		}
 	}
 
 	return !hasErrors
+}
+
+func colorize(text, color string) string {
+	if !colorOutputEnabled || color == "" {
+		return text
+	}
+
+	return color + text + ansiReset
+}
+
+func supportsColorOutput() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+
+	term := os.Getenv("TERM")
+	if term == "" || term == "dumb" {
+		return false
+	}
+
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func checkFlatpak() DoctorResult {
