@@ -26,7 +26,7 @@ var (
 	progressOutputWriter   io.Writer = os.Stdout
 	colorOutputEnabled               = supportsColorOutput()
 	ansiEscapePattern                = regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	loaderFrames                     = []string{"Ooo", "oOo", "ooO"}
+	loaderFrames                     = []string{"◜", "◠", "◝", "◞", "◡", "◟"}
 )
 
 const (
@@ -40,8 +40,7 @@ const (
 
 	defaultTerminalColumns = 80
 	frameHorizontalPadding = 4
-	loaderTickInterval     = 150 * time.Millisecond
-	loaderThirdFrameDelay  = 500 * time.Millisecond
+	loaderTickInterval     = 100 * time.Millisecond
 )
 
 type toolUpdatePlan struct {
@@ -392,7 +391,6 @@ type updateProgressRow struct {
 	skipped      bool
 	done         bool
 	packageCount int
-	startedAt    time.Time
 }
 
 type updateProgressRenderer struct {
@@ -400,17 +398,15 @@ type updateProgressRenderer struct {
 	rows       []updateProgressRow
 	frameIndex int
 	inPlace    bool
-	nowFunc    func() time.Time
+	labelWidth int
 }
 
 func newUpdateProgressRenderer(backends []toolBackend, writer io.Writer, inPlace bool) *updateProgressRenderer {
-	nowFunc := time.Now
 	rows := make([]updateProgressRow, 0, len(backends))
 	for _, backend := range backends {
 		rows = append(rows, updateProgressRow{
-			toolName:  backend.Name,
-			skipped:   backend.Skipped,
-			startedAt: nowFunc(),
+			toolName: backend.Name,
+			skipped:  backend.Skipped,
 		})
 	}
 
@@ -419,10 +415,10 @@ func newUpdateProgressRenderer(backends []toolBackend, writer io.Writer, inPlace
 	}
 
 	return &updateProgressRenderer{
-		writer:  writer,
-		rows:    rows,
-		inPlace: inPlace,
-		nowFunc: nowFunc,
+		writer:     writer,
+		rows:       rows,
+		inPlace:    inPlace,
+		labelWidth: maxToolLabelWidth(rows),
 	}
 }
 
@@ -468,26 +464,19 @@ func (r *updateProgressRenderer) lineForRow(index int) string {
 
 	row := r.rows[index]
 	if row.skipped {
-		return colorizedSkippedLoaderLine(row.toolName)
+		return colorizedSkippedLoaderLineWithWidth(row.toolName, r.labelWidth)
 	}
 
 	if row.done {
-		return colorizedDoneLoaderLine(row.toolName, row.packageCount)
+		return colorizedDoneLoaderLineWithWidth(row.toolName, row.packageCount, r.labelWidth)
 	}
 
 	if len(loaderFrames) == 0 {
-		return colorizedCheckingLoaderLine("", row.toolName)
+		return colorizedCheckingLoaderLineWithWidth("", row.toolName, r.labelWidth)
 	}
 
 	frame := loaderFrames[r.frameIndex]
-	if frame == "ooO" {
-		elapsed := r.nowFunc().Sub(row.startedAt)
-		if elapsed < loaderThirdFrameDelay {
-			frame = "oOo"
-		}
-	}
-
-	return colorizedCheckingLoaderLine(frame, row.toolName)
+	return colorizedCheckingLoaderLineWithWidth(frame, row.toolName, r.labelWidth)
 }
 
 func (r *updateProgressRenderer) redrawAllRows() {
@@ -502,40 +491,77 @@ func (r *updateProgressRenderer) redrawAllRows() {
 }
 
 func formatCheckingLoaderLine(frame, toolName string) string {
+	return formatCheckingLoaderLineWithWidth(frame, toolName, len(toolLabel(toolName)))
+}
+
+func formatCheckingLoaderLineWithWidth(frame, toolName string, labelWidth int) string {
 	frame = strings.TrimSpace(frame)
 	if frame == "" {
-		frame = "Ooo"
+		frame = "◜"
 	}
 
-	return fmt.Sprintf("%s [%s] checking...", frame, toolName)
+	return fmt.Sprintf("%s  %s checking...", paddedToolLabel(toolName, labelWidth), frame)
 }
 
 func formatDoneLoaderLine(toolName string, packages int) string {
-	return fmt.Sprintf("[%s] %d found", toolName, packages)
+	return formatDoneLoaderLineWithWidth(toolName, packages, len(toolLabel(toolName)))
+}
+
+func formatDoneLoaderLineWithWidth(toolName string, packages, labelWidth int) string {
+	return fmt.Sprintf("%s  %d found", paddedToolLabel(toolName, labelWidth), packages)
 }
 
 func colorizedCheckingLoaderLine(frame, toolName string) string {
-	plainFrame := strings.TrimSpace(frame)
-	if plainFrame == "" {
-		plainFrame = "Ooo"
-	}
+	return colorizedCheckingLoaderLineWithWidth(frame, toolName, len(toolLabel(toolName)))
+}
 
-	return fmt.Sprintf("%s %s %s",
-		colorize(plainFrame, ansiBoldCyan),
-		colorize("["+toolName+"]", ansiBlue),
-		colorize("checking...", ansiYellow),
-	)
+func colorizedCheckingLoaderLineWithWidth(frame, toolName string, labelWidth int) string {
+	return colorize(formatCheckingLoaderLineWithWidth(frame, toolName, labelWidth), ansiBlue)
 }
 
 func colorizedDoneLoaderLine(toolName string, packages int) string {
-	return fmt.Sprintf("%s %s",
-		colorize("["+toolName+"]", ansiBlue),
-		colorize(fmt.Sprintf("%d found", packages), ansiGreen),
-	)
+	return colorizedDoneLoaderLineWithWidth(toolName, packages, len(toolLabel(toolName)))
+}
+
+func colorizedDoneLoaderLineWithWidth(toolName string, packages, labelWidth int) string {
+	line := formatDoneLoaderLineWithWidth(toolName, packages, labelWidth)
+	if packages == 0 {
+		return colorize(line, ansiDim)
+	}
+
+	return colorize(line, ansiGreen)
 }
 
 func colorizedSkippedLoaderLine(toolName string) string {
-	return colorize(fmt.Sprintf("[%s] skipped", toolName), ansiDim)
+	return colorizedSkippedLoaderLineWithWidth(toolName, len(toolLabel(toolName)))
+}
+
+func colorizedSkippedLoaderLineWithWidth(toolName string, labelWidth int) string {
+	return colorize(fmt.Sprintf("%s  skipped", paddedToolLabel(toolName, labelWidth)), ansiDim)
+}
+
+func maxToolLabelWidth(rows []updateProgressRow) int {
+	maxWidth := 0
+	for _, row := range rows {
+		if width := len(toolLabel(row.toolName)); width > maxWidth {
+			maxWidth = width
+		}
+	}
+
+	return maxWidth
+}
+
+func toolLabel(toolName string) string {
+	return fmt.Sprintf("[%s]", toolName)
+}
+
+func paddedToolLabel(toolName string, labelWidth int) string {
+	label := toolLabel(toolName)
+	if labelWidth <= len(label) {
+		return label
+	}
+
+	return fmt.Sprintf("%-*s", labelWidth, label)
 }
 
 func miseBackend() toolBackend {

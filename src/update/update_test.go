@@ -246,9 +246,9 @@ func TestFormatCheckingLoaderLine(t *testing.T) {
 		tool  string
 		want  string
 	}{
-		{name: "mise", frame: "Ooo", tool: "mise", want: "Ooo [mise] checking..."},
-		{name: "flatpak", frame: "oOo", tool: "flatpak", want: "oOo [flatpak] checking..."},
-		{name: "dnf5", frame: "ooO", tool: "dnf5", want: "ooO [dnf5] checking..."},
+		{name: "mise", frame: "◜", tool: "mise", want: "[mise]  ◜ checking..."},
+		{name: "flatpak", frame: "◠", tool: "flatpak", want: "[flatpak]  ◠ checking..."},
+		{name: "dnf5", frame: "◟", tool: "dnf5", want: "[dnf5]  ◟ checking..."},
 	}
 
 	for _, tc := range testCases {
@@ -269,9 +269,9 @@ func TestFormatDoneLoaderLine(t *testing.T) {
 		count int
 		want  string
 	}{
-		{name: "mise", tool: "mise", count: 1, want: "[mise] 1 found"},
-		{name: "flatpak", tool: "flatpak", count: 7, want: "[flatpak] 7 found"},
-		{name: "dnf5", tool: "dnf5", count: 0, want: "[dnf5] 0 found"},
+		{name: "mise", tool: "mise", count: 1, want: "[mise]  1 found"},
+		{name: "flatpak", tool: "flatpak", count: 7, want: "[flatpak]  7 found"},
+		{name: "dnf5", tool: "dnf5", count: 0, want: "[dnf5]  0 found"},
 	}
 
 	for _, tc := range testCases {
@@ -288,42 +288,46 @@ func TestUpdateProgressRendererDoneStateFreezesLine(t *testing.T) {
 
 	renderer := newUpdateProgressRenderer([]toolBackend{{Name: "mise"}}, &bytes.Buffer{}, true)
 
-	if got := renderer.lineForRow(0); got != "Ooo [mise] checking..." {
+	if got := renderer.lineForRow(0); got != "[mise]  ◜ checking..." {
 		t.Fatalf("unexpected initial renderer line: %q", got)
 	}
 
 	renderer.AdvanceFrame()
-	if got := renderer.lineForRow(0); got != "oOo [mise] checking..." {
+	if got := renderer.lineForRow(0); got != "[mise]  ◠ checking..." {
 		t.Fatalf("unexpected animated renderer line: %q", got)
 	}
 
 	renderer.MarkDone(0, 2)
-	if got := renderer.lineForRow(0); got != "[mise] 2 found" {
+	if got := renderer.lineForRow(0); got != "[mise]  2 found" {
 		t.Fatalf("unexpected done renderer line: %q", got)
 	}
 
 	renderer.AdvanceFrame()
-	if got := renderer.lineForRow(0); got != "[mise] 2 found" {
+	if got := renderer.lineForRow(0); got != "[mise]  2 found" {
 		t.Fatalf("done line should stay frozen, got: %q", got)
 	}
 }
 
-func TestUpdateProgressRendererDefersThirdFrameUntilDelay(t *testing.T) {
+func TestUpdateProgressRendererCyclesArcFrames(t *testing.T) {
 	t.Parallel()
 
 	renderer := newUpdateProgressRenderer([]toolBackend{{Name: "mise"}}, &bytes.Buffer{}, true)
-	now := time.Now()
-	renderer.nowFunc = func() time.Time { return now }
-	renderer.rows[0].startedAt = now.Add(-300 * time.Millisecond)
-	renderer.frameIndex = 2
 
-	if got := renderer.lineForRow(0); got != "oOo [mise] checking..." {
-		t.Fatalf("expected third frame to be deferred before delay, got: %q", got)
+	frames := []string{
+		"[mise]  ◜ checking...",
+		"[mise]  ◠ checking...",
+		"[mise]  ◝ checking...",
+		"[mise]  ◞ checking...",
+		"[mise]  ◡ checking...",
+		"[mise]  ◟ checking...",
+		"[mise]  ◜ checking...",
 	}
 
-	renderer.rows[0].startedAt = now.Add(-700 * time.Millisecond)
-	if got := renderer.lineForRow(0); got != "ooO [mise] checking..." {
-		t.Fatalf("expected third frame to appear after delay, got: %q", got)
+	for idx, want := range frames {
+		if got := renderer.lineForRow(0); got != want {
+			t.Fatalf("unexpected frame at index %d\nwant: %q\ngot:  %q", idx, want, got)
+		}
+		renderer.AdvanceFrame()
 	}
 }
 
@@ -341,10 +345,10 @@ func TestUpdateProgressRendererNonInteractiveFallback(t *testing.T) {
 
 	got := output.String()
 	want := strings.Join([]string{
-		"Ooo [mise] checking...",
-		"Ooo [flatpak] checking...",
-		"[flatpak] 3 found",
-		"[mise] 1 found",
+		"[mise]     ◜ checking...",
+		"[flatpak]  ◜ checking...",
+		"[flatpak]  3 found",
+		"[mise]     1 found",
 	}, "\n") + "\n"
 
 	if got != want {
@@ -372,9 +376,9 @@ func TestUpdateProgressRendererShowsSkippedRows(t *testing.T) {
 
 	got := output.String()
 	want := strings.Join([]string{
-		"[mise] skipped",
-		"Ooo [flatpak] checking...",
-		"[flatpak] 2 found",
+		"[mise]     skipped",
+		"[flatpak]  ◜ checking...",
+		"[flatpak]  2 found",
 	}, "\n") + "\n"
 
 	if got != want {
